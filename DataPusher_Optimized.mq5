@@ -404,7 +404,17 @@ void SendData(string data) {
    
    int bytesSent = send(client, dataArray, ArraySize(dataArray)-1, 0);
    if(bytesSent == SOCKET_ERROR) {
-      ProcessSocketError(__FUNCTION__, WSAGetLastError());
+      int errorCode = WSAGetLastError();
+      
+      // WSAEWOULDBLOCK is not a fatal error in non-blocking mode
+      // It just means the send buffer is full, try again later
+      if(errorCode == WSAEWOULDBLOCK) {
+         Print("⚠️ Send buffer full (WSAEWOULDBLOCK), will retry later");
+         return;
+      }
+      
+      // Only treat other errors as fatal
+      ProcessSocketError(__FUNCTION__, errorCode);
    } else {
       Print("✅ Sent ", bytesSent, " bytes successfully");
    }
