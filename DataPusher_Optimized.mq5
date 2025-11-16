@@ -7,6 +7,16 @@
 #include <Trade/Trade.mqh>
 #include <JAson.mqh>
 
+// Additional socket functions for keepalive
+#import "Ws2_32.dll"
+int setsockopt(SOCKET64 s, int level, int optname, int &optval, int optlen);
+#import
+
+// Socket option constants
+#define SOL_SOCKET 0xFFFF
+#define SO_KEEPALIVE 0x0008
+#define MSG_PEEK 0x02
+
 // Connection settings
 #define SERVER_IP_ADDRESS "127.0.0.1"
 #define SERVER_PORT 8888
@@ -21,6 +31,7 @@
 // Message intervals (in seconds)
 #define SNAPSHOT_INTERVAL 30  // Full account snapshot every 30 seconds
 #define UPDATE_INTERVAL 5     // Quick updates every 5 seconds
+#define HEARTBEAT_INTERVAL 8  // Send heartbeat every 8 seconds to keep connection alive (more aggressive)
 
 // Global variables  
 SOCKET64 client = INVALID_SOCKET64;
@@ -37,6 +48,7 @@ int lastPositionsTotal = 0;
 int lastOrdersTotal = 0;
 datetime lastSnapshotSent = 0;
 datetime lastUpdateSent = 0;
+datetime lastDataSent = 0;  // Track last time any data was sent
 string lastPositionsHash = "";
 string lastOrdersHash = "";
 
@@ -53,6 +65,7 @@ bool HasPositionsChanged();
 bool HasOrdersChanged();
 string CalculatePositionsHash();
 string CalculateOrdersHash();
+void SendHeartbeat();
 
 //+------------------------------------------------------------------+
 //| Expert initialization function                                     |
@@ -69,6 +82,7 @@ int OnInit() {
    lastOrdersTotal = OrdersTotal();
    lastSnapshotSent = TimeCurrent();
    lastUpdateSent = TimeCurrent();
+   lastDataSent = TimeCurrent();
    lastPositionsHash = CalculatePositionsHash();
    lastOrdersHash = CalculateOrdersHash();
    
@@ -94,18 +108,48 @@ void OnDeinit(const int reason) {
 //+------------------------------------------------------------------+
 void OnTick() {
    // Handle reconnection if needed
-   if(expertStatus == STATUS_DISCONNECTED || expertStatus == STATUS_ERROR) {
-      if(int(TimeCurrent() - lastConnectionAttempt) >= reconnectDelay) {
-         Print("Attempting to reconnect...");
+   if(expertStatus == STATUS_DISCONNECTED || expertStatus == STATUS_ERROR || expertStatus == STATUS_RECONNECTING) {
+      datetime now = TimeCurrent();
+      int secondsSinceLastAttempt = (int)(now - lastConnectionAttempt);
+      
+      // Only attempt reconnection if enough time has passed
+      if(secondsSinceLastAttempt >= reconnectDelay) {
+         Print("Attempting to reconnect... (", secondsSinceLastAttempt, "s since last attempt)");
          expertStatus = STATUS_RECONNECTING;
          ConnectSocket();
+         
+         // After connection attempt, check if we're connected
+         if(expertStatus == STATUS_CONNECTED && IsSocketConnected()) {
+            Print("✅ Reconnection successful, sending snapshot...");
+            // Send full snapshot after reconnection
+            SendAccountSnapshot();
+         } else {
+            // Connection failed, reset for next attempt
+            Print("⚠️ Reconnection attempt failed, will retry in ", reconnectDelay, " seconds");
+            expertStatus = STATUS_DISCONNECTED;
+            lastConnectionAttempt = TimeCurrent();
+         }
       }
       return;
    }
    
-   if(!IsSocketConnected()) return;
+   // Verify connection is still alive
+   if(!IsSocketConnected()) {
+      expertStatus = STATUS_DISCONNECTED;
+      lastConnectionAttempt = TimeCurrent();
+      return;
+   }
    
    datetime now = TimeCurrent();
+   
+   // Note: Removed aggressive health check using recv() as it was causing disconnections
+   // Connection health will be detected by send() errors instead
+   
+   // 0. Send heartbeat if idle too long (prevents connection timeout)
+   if(int(now - lastDataSent) >= HEARTBEAT_INTERVAL) {
+      SendHeartbeat();
+      return; // One message per tick
+   }
    
    // 1. Check if we need to send full snapshot (every 30 seconds)
    if(int(now - lastSnapshotSent) >= SNAPSHOT_INTERVAL) {
@@ -131,12 +175,11 @@ void OnTick() {
       return; // One message per tick
    }
    
-   // 4. Check for equity changes (send quick update every 5 seconds if changed)
+   // 4. Check for equity changes (send quick update every 5 seconds)
+   // Send update even if equity hasn't changed to keep connection alive
    if(int(now - lastUpdateSent) >= UPDATE_INTERVAL) {
-      if(HasEquityChanged()) {
-         SendQuickUpdate();
-         lastUpdateSent = now;
-      }
+      SendQuickUpdate();
+      lastUpdateSent = now;
    }
 }
 
@@ -144,50 +187,72 @@ void OnTick() {
 //| Socket connection function                                         |
 //+------------------------------------------------------------------+
 void ConnectSocket() {
-   if(client == INVALID_SOCKET64) {
-      lastConnectionAttempt = TimeCurrent();
-      
-      char wsaData[]; ArrayResize(wsaData,sizeof(WSAData));
-      int res = WSAStartup(MAKEWORD(2,2),wsaData);
-      if(res != 0) {
-         ProcessSocketError(__FUNCTION__, res);
-         return;
-      }
-
-      client = socket(AF_INET,SOCK_STREAM,IPPROTO_TCP);
-      if(client == INVALID_SOCKET64) {
-         ProcessSocketError(__FUNCTION__, WSAGetLastError());
-         return;
-      }
-
-      char ch[];
-      StringToCharArray(SERVER_IP_ADDRESS,ch);
-      sockaddr_in addrin;
-      addrin.sin_family = AF_INET;
-      addrin.sin_addr = inet_addr(ch);
-      addrin.sin_port = htons(SERVER_PORT);
-      ref_sockaddr ref;
-      sockaddrIn2RefSockaddr(addrin,ref);
-
-      res = connect(client,ref.ref,sizeof(addrin));
-      if(res == SOCKET_ERROR) {
-         int err = WSAGetLastError();
-         if(err != WSAEISCONN) {
-            ProcessSocketError(__FUNCTION__, err);
-            return;
-         }
-      }
-
-      int non_block=1;
-      res = ioctlsocket(client,(int)FIONBIO,non_block);
-      if(res != NO_ERROR) {
-         ProcessSocketError(__FUNCTION__, res);
-         return;
-      }
-
-      expertStatus = STATUS_CONNECTED;
-      Print(__FUNCTION__," > socket created and connected successfully");
+   // Always close existing socket before reconnecting
+   if(client != INVALID_SOCKET64) {
+      closesocket(client);
+      client = INVALID_SOCKET64;
    }
+   
+   lastConnectionAttempt = TimeCurrent();
+   
+   char wsaData[]; ArrayResize(wsaData,sizeof(WSAData));
+   int res = WSAStartup(MAKEWORD(2,2),wsaData);
+   if(res != 0) {
+      Print("⚠️ WSAStartup failed: ", res);
+      expertStatus = STATUS_ERROR;
+      return;
+   }
+
+   client = socket(AF_INET,SOCK_STREAM,IPPROTO_TCP);
+   if(client == INVALID_SOCKET64) {
+      int err = WSAGetLastError();
+      Print("⚠️ Socket creation failed: ", WSAErrorDescript(err));
+      WSACleanup();
+      expertStatus = STATUS_ERROR;
+      return;
+   }
+
+   char ch[];
+   StringToCharArray(SERVER_IP_ADDRESS,ch);
+   sockaddr_in addrin;
+   addrin.sin_family = AF_INET;
+   addrin.sin_addr = inet_addr(ch);
+   addrin.sin_port = htons(SERVER_PORT);
+   ref_sockaddr ref;
+   sockaddrIn2RefSockaddr(addrin,ref);
+
+   res = connect(client,ref.ref,sizeof(addrin));
+   if(res == SOCKET_ERROR) {
+      int err = WSAGetLastError();
+      if(err != WSAEISCONN && err != WSAEWOULDBLOCK && err != WSAEINPROGRESS) {
+         Print("⚠️ Connection failed: ", WSAErrorDescript(err));
+         closesocket(client);
+         client = INVALID_SOCKET64;
+         WSACleanup();
+         expertStatus = STATUS_ERROR;
+         return;
+      }
+      // WSAEWOULDBLOCK or WSAEINPROGRESS is OK for non-blocking socket
+   }
+
+   int non_block=1;
+   res = ioctlsocket(client,(int)FIONBIO,non_block);
+   if(res != NO_ERROR) {
+      Print("⚠️ ioctlsocket failed: ", res);
+      closesocket(client);
+      client = INVALID_SOCKET64;
+      WSACleanup();
+      expertStatus = STATUS_ERROR;
+      return;
+   }
+
+   // Enable TCP keepalive to prevent idle connection timeout
+   int keepalive = 1;
+   setsockopt(client, SOL_SOCKET, SO_KEEPALIVE, keepalive, sizeof(int));
+
+   expertStatus = STATUS_CONNECTED;
+   lastDataSent = TimeCurrent();
+   Print(__FUNCTION__," > socket created and connected successfully");
 }
 
 //+------------------------------------------------------------------+
@@ -195,6 +260,8 @@ void ConnectSocket() {
 //+------------------------------------------------------------------+
 void CloseClean() {
    if(client != INVALID_SOCKET64) {
+      // Shutdown socket gracefully before closing
+      shutdown(client, 2); // 2 = SD_BOTH (shutdown both send and receive)
       closesocket(client);
       client = INVALID_SOCKET64;
    }
@@ -389,6 +456,9 @@ string GetCurrentTimestamp() {
 void SendData(string data) {
    if(!IsSocketConnected()) return;
    
+   // Note: Removed health check before send - send() will detect connection errors
+   // This avoids interfering with the connection using recv()
+   
    // Log the data being sent (first 200 chars to avoid spam)
    string preview = StringSubstr(data, 0, 200);
    if(StringLen(data) > 200) {
@@ -399,7 +469,7 @@ void SendData(string data) {
    // Add message terminator
    data = data + "\n";
    
-   uchar dataArray[];
+   char dataArray[];
    StringToCharArray(data, dataArray);
    
    int bytesSent = send(client, dataArray, ArraySize(dataArray)-1, 0);
@@ -413,10 +483,27 @@ void SendData(string data) {
          return;
       }
       
+      // Connection abort errors - connection was closed unexpectedly
+      if(errorCode == WSAECONNABORTED || errorCode == WSAECONNRESET || errorCode == WSAENOTCONN || errorCode == WSAESHUTDOWN) {
+         Print("⚠️ Connection lost during send (", errorCode, "), will reconnect");
+         CloseClean();
+         expertStatus = STATUS_DISCONNECTED;
+         lastConnectionAttempt = TimeCurrent();
+         return;
+      }
+      
       // Only treat other errors as fatal
       ProcessSocketError(__FUNCTION__, errorCode);
+   } else if(bytesSent == 0) {
+      // send() returned 0 - connection was closed by peer
+      Print("⚠️ Connection closed by peer (send returned 0), will reconnect");
+      CloseClean();
+      expertStatus = STATUS_DISCONNECTED;
+      lastConnectionAttempt = TimeCurrent();
+      return;
    } else {
       Print("✅ Sent ", bytesSent, " bytes successfully");
+      lastDataSent = TimeCurrent(); // Update last data sent time
    }
 }
 
@@ -500,6 +587,20 @@ string CalculateOrdersHash() {
 }
 
 //+------------------------------------------------------------------+
+//| Send heartbeat to keep connection alive                           |
+//+------------------------------------------------------------------+
+void SendHeartbeat() {
+   CJAVal data;
+   
+   data["type"] = "heartbeat";
+   data["login"] = (string)AccountInfoInteger(ACCOUNT_LOGIN);
+   data["timestamp"] = GetCurrentTimestamp();
+   
+   SendData(data.Serialize());
+   Print("💓 Sent heartbeat");
+}
+
+//+------------------------------------------------------------------+
 //| Error handling function                                            |
 //+------------------------------------------------------------------+
 void ProcessSocketError(string functionName, int errorCode) {
@@ -512,6 +613,8 @@ void ProcessSocketError(string functionName, int errorCode) {
 //| Socket connection check function                                   |
 //+------------------------------------------------------------------+
 bool IsSocketConnected() {
-   return client != INVALID_SOCKET64;
+   // Basic check - socket handle must be valid
+   // Actual connection state will be detected by send() errors
+   return client != INVALID_SOCKET64 && expertStatus == STATUS_CONNECTED;
 }
 
