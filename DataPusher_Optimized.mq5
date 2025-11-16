@@ -1016,29 +1016,80 @@ void HandleQuery(CJAVal &query) {
       datetime from = (fromTs>0 ? (datetime)fromTs : (datetime)(TimeCurrent() - 30*24*60*60)); // default 30d
       datetime to = (toTs>0 ? (datetime)toTs : TimeCurrent());
       
+      // 1) Compute base balance at 'from' by backing out deltas from (from, now]
+      datetime nowdt = TimeCurrent();
+      double baseBalance = AccountInfoDouble(ACCOUNT_BALANCE);
+      if(HistorySelect(from, nowdt)) {
+         int totb = HistoryDealsTotal();
+         for(int i=0;i<totb;i++) {
+            ulong deal = HistoryDealGetTicket(i);
+            if(deal<=0) continue;
+            long ts = (long)HistoryDealGetInteger(deal, DEAL_TIME);
+            if(ts <= from) continue;
+            int dtype = (int)HistoryDealGetInteger(deal, DEAL_TYPE);
+            int entry = (int)HistoryDealGetInteger(deal, DEAL_ENTRY);
+            double dprof = HistoryDealGetDouble(deal, DEAL_PROFIT);
+            bool isBalanceAffect = (dtype == DEAL_TYPE_BALANCE || dtype == DEAL_TYPE_CREDIT || dtype == DEAL_TYPE_CHARGE
+                                    || dtype == DEAL_TYPE_BONUS || dtype == DEAL_TYPE_COMMISSION || dtype == DEAL_TYPE_COMMISSION_DAILY
+                                    || dtype == DEAL_TYPE_COMMISSION_MONTHLY || dtype == DEAL_TYPE_INTEREST
+                                    || dtype == DEAL_TYPE_BUY || dtype == DEAL_TYPE_SELL);
+            // For trades, only count realized (exit) profit into balance
+            if((dtype == DEAL_TYPE_BUY || dtype == DEAL_TYPE_SELL) && entry != DEAL_ENTRY_OUT) isBalanceAffect = false;
+            if(!isBalanceAffect) continue;
+            baseBalance -= dprof;
+         }
+      }
+      
+      // 2) Build in-range events and cumulative absolute balance after each event
       if(!HistorySelect(from, to)) {
          resp["ok"] = false;
          resp["error"] = "HistorySelect failed";
       } else {
+         // Collect and sort by time asc (History* lists are typically time-sorted, but ensure)
+         struct BEvent { long t; double delta; ulong ticket; int dtype; string comment; };
+         BEvent evs[];
          int total = HistoryDealsTotal();
-         CJAVal events;
          for(int i=0;i<total;i++) {
             ulong dealTicket = HistoryDealGetTicket(i);
             if(dealTicket<=0) continue;
-            
             int dtype = (int)HistoryDealGetInteger(dealTicket, DEAL_TYPE);
-            // Balance-affecting non-trade operations + commissions/fees
+            int entry = (int)HistoryDealGetInteger(dealTicket, DEAL_ENTRY);
+            // Include balance-affecting ops and realized trade profit (exit deals)
             bool include = (dtype == DEAL_TYPE_BALANCE || dtype == DEAL_TYPE_CREDIT || dtype == DEAL_TYPE_CHARGE
                             || dtype == DEAL_TYPE_BONUS || dtype == DEAL_TYPE_COMMISSION || dtype == DEAL_TYPE_COMMISSION_DAILY
-                            || dtype == DEAL_TYPE_COMMISSION_MONTHLY || dtype == DEAL_TYPE_INTEREST);
+                            || dtype == DEAL_TYPE_COMMISSION_MONTHLY || dtype == DEAL_TYPE_INTEREST
+                            || ((dtype == DEAL_TYPE_BUY || dtype == DEAL_TYPE_SELL) && entry == DEAL_ENTRY_OUT));
             if(!include) continue;
-            
+            long tme = (long)HistoryDealGetInteger(dealTicket, DEAL_TIME);
+            double dlt = HistoryDealGetDouble(dealTicket, DEAL_PROFIT);
+            int szb = ArraySize(evs);
+            ArrayResize(evs, szb+1);
+            evs[szb].t = tme;
+            evs[szb].delta = dlt;
+            evs[szb].ticket = dealTicket;
+            evs[szb].dtype = dtype;
+            evs[szb].comment = HistoryDealGetString(dealTicket, DEAL_COMMENT);
+         }
+         // Insertion sort by time
+         int nb = ArraySize(evs);
+         for(int i=1;i<nb;i++) {
+            BEvent key = evs[i];
+            int j = i-1;
+            while(j>=0 && evs[j].t > key.t) { evs[j+1]=evs[j]; j--; }
+            evs[j+1] = key;
+         }
+         // Build response with running absolute balance
+         CJAVal events;
+         double running = baseBalance;
+         for(int i=0;i<nb;i++) {
+            running += evs[i].delta;
             CJAVal e;
-            e["ticket"] = (long)dealTicket;
-            e["time"] = (long)HistoryDealGetInteger(dealTicket, DEAL_TIME);
-            e["type"] = dtype;
-            e["comment"] = HistoryDealGetString(dealTicket, DEAL_COMMENT);
-            e["profit"] = HistoryDealGetDouble(dealTicket, DEAL_PROFIT); // positive deposit/credit, negative withdrawals/fees
+            e["time"] = (long)evs[i].t;
+            e["ticket"] = (long)evs[i].ticket;
+            e["type"] = evs[i].dtype;
+            e["delta"] = evs[i].delta;
+            e["balance"] = running; // absolute balance after this event
+            e["comment"] = evs[i].comment;
             events.Add(e);
          }
          resp["data"] = events;
@@ -1057,49 +1108,69 @@ void HandleQuery(CJAVal &query) {
       datetime from = (fromTs>0 ? (datetime)fromTs : (datetime)(TimeCurrent() - 30*24*60*60));
       datetime to = (toTs>0 ? (datetime)toTs : TimeCurrent());
       
+      // Equity curve should be based on balance plus all realized changes, same base as balance history.
+      // So compute baseAtFrom exactly like for balance history (balance at 'from').
+      datetime nowdt2 = TimeCurrent();
+      double baseAtFrom = AccountInfoDouble(ACCOUNT_BALANCE);
+      if(HistorySelect(from, nowdt2)) {
+         int tot2 = HistoryDealsTotal();
+         for(int i=0;i<tot2;i++) {
+            ulong deal2 = HistoryDealGetTicket(i);
+            if(deal2<=0) continue;
+            long ts2 = (long)HistoryDealGetInteger(deal2, DEAL_TIME);
+            if(ts2 <= from) continue;
+            int dtype2 = (int)HistoryDealGetInteger(deal2, DEAL_TYPE);
+            int entry2 = (int)HistoryDealGetInteger(deal2, DEAL_ENTRY);
+            double pr2 = HistoryDealGetDouble(deal2, DEAL_PROFIT);
+            bool includeBal = (dtype2 == DEAL_TYPE_BALANCE || dtype2 == DEAL_TYPE_CREDIT || dtype2 == DEAL_TYPE_CHARGE
+                               || dtype2 == DEAL_TYPE_BONUS || dtype2 == DEAL_TYPE_COMMISSION || dtype2 == DEAL_TYPE_COMMISSION_DAILY
+                               || dtype2 == DEAL_TYPE_COMMISSION_MONTHLY || dtype2 == DEAL_TYPE_INTEREST
+                               || ((dtype2 == DEAL_TYPE_BUY || dtype2 == DEAL_TYPE_SELL) && entry2 == DEAL_ENTRY_OUT));
+            if(!includeBal) continue;
+            baseAtFrom -= pr2;
+         }
+      }
+
       if(!HistorySelect(from, to)) {
          resp["ok"] = false;
          resp["error"] = "HistorySelect failed";
       } else {
-         // Build cumulative closed P&L over time (equity_closed curve)
+         // Build equity curve using same deltas as balance (deposits, withdrawals, commissions, realized trades).
+         struct EqEv { long t; double delta; };
+         EqEv eqevs[];
          int total = HistoryDealsTotal();
-         
-         // Collect trade deals only (buy/sell) and accumulate profit
-         struct Pnt { long t; double v; };
-         Pnt points[];
-         
          for(int i=0;i<total;i++) {
-            ulong dealTicket = HistoryDealGetTicket(i);
-            if(dealTicket<=0) continue;
-            int dtype = (int)HistoryDealGetInteger(dealTicket, DEAL_TYPE);
-            if(dtype != DEAL_TYPE_BUY && dtype != DEAL_TYPE_SELL) continue;
-            long dtm = (long)HistoryDealGetInteger(dealTicket, DEAL_TIME);
-            double profit = HistoryDealGetDouble(dealTicket, DEAL_PROFIT);
-            int sz = ArraySize(points);
-            ArrayResize(points, sz+1);
-            points[sz].t = dtm;
-            points[sz].v = profit;
+            ulong dticket = HistoryDealGetTicket(i);
+            if(dticket<=0) continue;
+            int dtype = (int)HistoryDealGetInteger(dticket, DEAL_TYPE);
+            int entry = (int)HistoryDealGetInteger(dticket, DEAL_ENTRY);
+            bool includeEq = (dtype == DEAL_TYPE_BALANCE || dtype == DEAL_TYPE_CREDIT || dtype == DEAL_TYPE_CHARGE
+                              || dtype == DEAL_TYPE_BONUS || dtype == DEAL_TYPE_COMMISSION || dtype == DEAL_TYPE_COMMISSION_DAILY
+                              || dtype == DEAL_TYPE_COMMISSION_MONTHLY || dtype == DEAL_TYPE_INTEREST
+                              || ((dtype == DEAL_TYPE_BUY || dtype == DEAL_TYPE_SELL) && entry == DEAL_ENTRY_OUT));
+            if(!includeEq) continue;
+            long tme = (long)HistoryDealGetInteger(dticket, DEAL_TIME);
+            double dlt = HistoryDealGetDouble(dticket, DEAL_PROFIT);
+            int sz = ArraySize(eqevs);
+            ArrayResize(eqevs, sz+1);
+            eqevs[sz].t = tme;
+            eqevs[sz].delta = dlt;
          }
-         
-         // Sort by time (insertion sort for small arrays)
-         int n = ArraySize(points);
+         // Sort by time asc
+         int n = ArraySize(eqevs);
          for(int i=1;i<n;i++) {
-            Pnt key = points[i];
+            EqEv key = eqevs[i];
             int j = i-1;
-            while(j>=0 && points[j].t > key.t) {
-               points[j+1] = points[j];
-               j--;
-            }
-            points[j+1] = key;
+            while(j>=0 && eqevs[j].t > key.t) { eqevs[j+1]=eqevs[j]; j--; }
+            eqevs[j+1] = key;
          }
-         
          CJAVal arr;
-         double cumulative = 0.0;
+         double eq = baseAtFrom;
          for(int i=0;i<n;i++) {
-            cumulative += points[i].v;
+            eq += eqevs[i].delta;
             CJAVal e;
-            e["time"] = (long)points[i].t;
-            e["equity_closed"] = cumulative;
+            e["time"] = (long)eqevs[i].t;
+            e["equity"] = eq; // equity based on balance + all realized changes
             arr.Add(e);
          }
          resp["data"] = arr;
