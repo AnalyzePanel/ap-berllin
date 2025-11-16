@@ -675,9 +675,32 @@ bool TryReceiveLine(string &lineOut) {
       return false;
    }
    
-   // Append to string buffer
+   // Append to string buffer (convert bytes -> UTF-8 string explicitly)
    string chunk;
-   CharArrayToString(buf, chunk, 0, received);
+   uchar ubuf[];
+   ArrayResize(ubuf, received);
+   for(int i=0;i<received;i++) ubuf[i] = (uchar)buf[i];
+   // Build string manually to skip any null bytes and avoid early termination
+   // while still preserving UTF-8 bytes as-is.
+   int nonzero = 0;
+   for(int j=0;j<received;j++) {
+      uchar b = ubuf[j];
+      if(b == 0) continue; // skip nulls
+      nonzero++;
+      // Append raw byte; for UTF-8 this is safe as MQL5 strings are UTF-16,
+      // but appending byte-by-byte preserves content for JSON ASCII.
+      chunk += CharToString((ushort)b);
+   }
+   // Hex preview of first bytes to diagnose framing/encoding
+   string hexPrev = "";
+   int maxHex = (received < 32 ? received : 32);
+   for(int k=0;k<maxHex;k++) {
+      hexPrev += StringFormat("%02X ", ubuf[k]);
+   }
+   // Debug: log raw recv preview and byte count
+   string rprev = StringSubstr(chunk, 0, 180);
+   if(StringLen(chunk) > 180) rprev += "...";
+   Print("📩 recv(", received, " bytes, nonzero=", nonzero, ") chunk=", rprev, " | hex=", hexPrev);
    recvBuffer += chunk;
    
    // Extract one line if newline present
@@ -701,6 +724,11 @@ void HandleIncomingMessage(const string message) {
    // Ignore empty
    if(StringLen(message) == 0) return;
    
+   // Log a short preview of any incoming line
+   string _preview = StringSubstr(message, 0, 180);
+   if(StringLen(message) > 180) _preview += "...";
+   Print("📥 Incoming line from Tokyo: ", _preview);
+   
    // Parse JSON
    CJAVal parsed;
    if(!parsed.Deserialize(message)) {
@@ -713,6 +741,8 @@ void HandleIncomingMessage(const string message) {
    
    // Expect queries with type="query"
    if(msgType == "query") {
+      // Log that a query type message is being handled
+      Print("🧭 Received query message");
       HandleQuery(parsed);
       return;
    }
@@ -729,6 +759,16 @@ void HandleQuery(CJAVal &query) {
    string requestId = (reqIdPtr != NULL ? reqIdPtr.ToStr() : "");
    string action = (actionPtr != NULL ? actionPtr.ToStr() : "");
    
+   // Log action, requestId and lightweight params preview
+   string paramsPreview = "";
+   CJAVal *paramsPtr = query["params"];
+   if(CheckPointer(paramsPtr) != POINTER_INVALID) {
+      string raw = paramsPtr.Serialize();
+      paramsPreview = StringSubstr(raw, 0, 200);
+      if(StringLen(raw) > 200) paramsPreview += "...";
+   }
+   Print("🔎 Query received | action=", action, " | requestId=", requestId, " | params=", paramsPreview);
+   
    CJAVal resp;
    resp["type"] = "response";
    resp["requestId"] = requestId;
@@ -738,6 +778,13 @@ void HandleQuery(CJAVal &query) {
    
    bool handled = true;
    
+   if(action == "ping") {
+      // Simple liveness response
+      CJAVal pong;
+      pong["message"] = "pong";
+      pong["ea_time"] = GetCurrentTimestamp();
+      resp["data"] = pong;
+   } else
    if(action == "get_account") {
       // Include latest account snapshot
       CJAVal acc;
@@ -1139,8 +1186,10 @@ void HandleQuery(CJAVal &query) {
    }
    
    if(handled) {
+      Print("✅ Query handled | action=", action, " | requestId=", requestId);
       SendData(resp.Serialize());
    } else {
+      Print("⚠️ Unknown query action | action=", action, " | requestId=", requestId);
       SendData(resp.Serialize());
    }
 }
