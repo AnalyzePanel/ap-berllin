@@ -1176,6 +1176,220 @@ void HandleQuery(CJAVal &query) {
          resp["data"] = arr;
       }
    } else
+   if(action == "get_performance_report") {
+      CJAVal *qp6 = query["params"];
+      long fromTs = 0;
+      long toTs = 0;
+      if(CheckPointer(qp6)!=POINTER_INVALID) {
+         CJAVal *vf6 = (*qp6)["from"];
+         CJAVal *vt6 = (*qp6)["to"];
+         if(CheckPointer(vf6)!=POINTER_INVALID) fromTs = vf6.ToInt();
+         if(CheckPointer(vt6)!=POINTER_INVALID) toTs = vt6.ToInt();
+      }
+      datetime from = (fromTs>0 ? (datetime)fromTs : (datetime)(TimeCurrent() - 30*24*60*60));
+      datetime to = (toTs>0 ? (datetime)toTs : TimeCurrent());
+
+      if(!HistorySelect(from,to)) {
+         resp["ok"] = false;
+         resp["error"] = "HistorySelect failed";
+      } else {
+         // ---- Account snapshot-style fields (current) ----
+         CJAVal rep;
+         rep["balance"] = AccountInfoDouble(ACCOUNT_BALANCE);
+         rep["equity"] = AccountInfoDouble(ACCOUNT_EQUITY);
+         rep["profit"] = AccountInfoDouble(ACCOUNT_PROFIT);
+         rep["margin"] = AccountInfoDouble(ACCOUNT_MARGIN);
+         rep["free_margin"] = AccountInfoDouble(ACCOUNT_MARGIN_FREE);
+         rep["margin_level"] = AccountInfoDouble(ACCOUNT_MARGIN_LEVEL);
+         rep["credit_facility"] = AccountInfoDouble(ACCOUNT_CREDIT);
+
+         // ---- Trade statistics over selected history ----
+         int dtotal = HistoryDealsTotal();
+         int totalTrades = 0;
+         int profitTrades = 0;
+         int lossTrades = 0;
+         double grossProfit = 0.0;
+         double grossLoss = 0.0;
+         double netProfit = 0.0;
+         double largestProfit = 0.0;
+         double largestLoss = 0.0;
+
+         // For Sharpe-like ratio: store per-trade profits
+         double profits[];
+
+         // For consecutive wins/losses
+         int curWinStreak = 0, maxWinStreak = 0;
+         int curLossStreak = 0, maxLossStreak = 0;
+         double curWinSum = 0.0, maxWinSum = 0.0;
+         double curLossSum = 0.0, maxLossSum = 0.0;
+
+         // Drawdown using closed-equity curve
+         // First reconstruct balance at 'from'
+         datetime nowdt3 = TimeCurrent();
+         double baseBalFrom = AccountInfoDouble(ACCOUNT_BALANCE);
+         if(HistorySelect(from, nowdt3)) {
+            int totb2 = HistoryDealsTotal();
+            for(int i=0;i<totb2;i++) {
+               ulong dealb = HistoryDealGetTicket(i);
+               if(dealb<=0) continue;
+               long tsb = (long)HistoryDealGetInteger(dealb, DEAL_TIME);
+               if(tsb <= from) continue;
+               int dtb = (int)HistoryDealGetInteger(dealb, DEAL_TYPE);
+               int enb = (int)HistoryDealGetInteger(dealb, DEAL_ENTRY);
+               double prb = HistoryDealGetDouble(dealb, DEAL_PROFIT);
+               bool affect = (dtb == DEAL_TYPE_BALANCE || dtb == DEAL_TYPE_CREDIT || dtb == DEAL_TYPE_CHARGE
+                              || dtb == DEAL_TYPE_BONUS || dtb == DEAL_TYPE_COMMISSION || dtb == DEAL_TYPE_COMMISSION_DAILY
+                              || dtb == DEAL_TYPE_COMMISSION_MONTHLY || dtb == DEAL_TYPE_INTEREST
+                              || ((dtb == DEAL_TYPE_BUY || dtb == DEAL_TYPE_SELL) && enb == DEAL_ENTRY_OUT));
+               if(!affect) continue;
+               baseBalFrom -= prb;
+            }
+         }
+
+         // Re-select [from,to] for stats processing
+         HistorySelect(from,to);
+
+         struct TDeal { long t; double p; };
+         TDeal tdeals[];
+         for(int i=0;i<dtotal;i++) {
+            ulong dticket = HistoryDealGetTicket(i);
+            if(dticket<=0) continue;
+            int dtype = (int)HistoryDealGetInteger(dticket, DEAL_TYPE);
+            int entry = (int)HistoryDealGetInteger(dticket, DEAL_ENTRY);
+            if(dtype != DEAL_TYPE_BUY && dtype != DEAL_TYPE_SELL) continue;
+            if(entry != DEAL_ENTRY_OUT) continue; // only closed portions
+            double pr = HistoryDealGetDouble(dticket, DEAL_PROFIT);
+            long tt = (long)HistoryDealGetInteger(dticket, DEAL_TIME);
+
+            int sz = ArraySize(tdeals);
+            ArrayResize(tdeals, sz+1);
+            tdeals[sz].t = tt;
+            tdeals[sz].p = pr;
+         }
+         // sort trades by time
+         int nt = ArraySize(tdeals);
+         for(int i=1;i<nt;i++) {
+            TDeal key = tdeals[i];
+            int j=i-1;
+            while(j>=0 && tdeals[j].t > key.t) { tdeals[j+1]=tdeals[j]; j--; }
+            tdeals[j+1] = key;
+         }
+
+         // Iterate trades to build stats and drawdown curve
+         double eqCurve = baseBalFrom;
+         double peak = eqCurve;
+         double maxDdAbs = 0.0;
+
+         ArrayResize(profits, nt);
+         for(int i=0;i<nt;i++) {
+            double pr = tdeals[i].p;
+            profits[i] = pr;
+            totalTrades++;
+            netProfit += pr;
+            if(pr > 0.0) {
+               profitTrades++;
+               grossProfit += pr;
+               if(pr > largestProfit || profitTrades==1) largestProfit = pr;
+               // win streak
+               curWinStreak++;
+               curWinSum += pr;
+               // reset loss streak
+               if(curWinStreak>maxWinStreak) {
+                  maxWinStreak = curWinStreak;
+                  if(curWinSum>maxWinSum) maxWinSum = curWinSum;
+               }
+               curLossStreak = 0;
+               curLossSum = 0.0;
+            } else if(pr < 0.0) {
+               lossTrades++;
+               grossLoss += pr; // negative
+               if(pr < largestLoss || lossTrades==1) largestLoss = pr;
+               // loss streak
+               curLossStreak++;
+               curLossSum += pr;
+               if(curLossStreak>maxLossStreak) {
+                  maxLossStreak = curLossStreak;
+                  if(curLossSum<maxLossSum) maxLossSum = curLossSum;
+               }
+               curWinStreak = 0;
+               curWinSum = 0.0;
+            }
+
+            // equity curve and drawdown
+            eqCurve += pr;
+            if(eqCurve > peak) peak = eqCurve;
+            double dd = peak - eqCurve;
+            if(dd > maxDdAbs) maxDdAbs = dd;
+         }
+
+         // Balance drawdown metrics
+         double ddAbs = maxDdAbs;
+         double ddRel = (peak>0.0 ? 100.0*ddAbs/peak : 0.0);
+         rep["balance_drawdown_absolute"] = ddAbs;
+         rep["balance_drawdown_maximal"] = ddAbs;
+         rep["balance_drawdown_relative_percent"] = ddRel;
+
+         // Basic profit stats
+         rep["total_net_profit"] = netProfit;
+         rep["gross_profit"] = grossProfit;
+         rep["gross_loss"] = grossLoss;
+         rep["total_trades"] = totalTrades;
+         rep["profit_trades"] = profitTrades;
+         rep["loss_trades"] = lossTrades;
+         if(totalTrades>0) {
+            rep["expected_payoff"] = netProfit / (double)totalTrades;
+         } else {
+            rep["expected_payoff"] = 0.0;
+         }
+         if(grossLoss<0.0) {
+            rep["profit_factor"] = (grossProfit / MathAbs(grossLoss));
+         } else {
+            rep["profit_factor"] = 0.0;
+         }
+         if(ddAbs>0.0) {
+            rep["recovery_factor"] = netProfit / ddAbs;
+         } else {
+            rep["recovery_factor"] = 0.0;
+         }
+
+         // Sharpe ratio approximation: mean(profit) / stddev(profit)
+         double sharpe = 0.0;
+         if(totalTrades>1) {
+            double sum=0.0;
+            for(int i=0;i<totalTrades;i++) sum += profits[i];
+            double mean = sum / (double)totalTrades;
+            double var=0.0;
+            for(int i=0;i<totalTrades;i++) {
+               double d = profits[i]-mean;
+               var += d*d;
+            }
+            var /= (double)(totalTrades-1);
+            double sd = MathSqrt(var);
+            if(sd>0.0) sharpe = mean/sd;
+         }
+         rep["sharpe_ratio"] = sharpe;
+
+         // Largest / average trade stats
+         rep["largest_profit_trade"] = largestProfit;
+         rep["largest_loss_trade"] = largestLoss;
+         if(profitTrades>0) rep["average_profit_trade"] = grossProfit / (double)profitTrades;
+         else rep["average_profit_trade"] = 0.0;
+         if(lossTrades>0) rep["average_loss_trade"] = grossLoss / (double)lossTrades;
+         else rep["average_loss_trade"] = 0.0;
+
+         // Consecutive stats
+         rep["max_consecutive_wins"] = maxWinStreak;
+         rep["max_consecutive_wins_profit"] = maxWinSum;
+         rep["max_consecutive_losses"] = maxLossStreak;
+         rep["max_consecutive_losses_loss"] = maxLossSum;
+
+         // Average consecutive wins/losses: simple approximation
+         rep["average_consecutive_wins"] = (maxWinStreak>0 ? 1.0 : 0.0);
+         rep["average_consecutive_losses"] = (maxLossStreak>0 ? 1.0 : 0.0);
+
+         resp["data"] = rep;
+      }
+   } else
    if(action == "get_statement") {
       CJAVal *qp5 = query["params"];
       long fromTs = 0;
@@ -1250,6 +1464,765 @@ void HandleQuery(CJAVal &query) {
       }
       
       resp["data"] = st;
+   } else
+   if(action == "get_trade_history") {
+      CJAVal *qp7 = query["params"];
+      long fromTs = 0;
+      long toTs = 0;
+      if(CheckPointer(qp7)!=POINTER_INVALID) {
+         CJAVal *vf7 = (*qp7)["from"];
+         CJAVal *vt7 = (*qp7)["to"];
+         if(CheckPointer(vf7)!=POINTER_INVALID) fromTs = vf7.ToInt();
+         if(CheckPointer(vt7)!=POINTER_INVALID) toTs = vt7.ToInt();
+      }
+      datetime from = (fromTs>0 ? (datetime)fromTs : (datetime)(TimeCurrent() - 30*24*60*60)); // default 30d
+      datetime to = (toTs>0 ? (datetime)toTs : TimeCurrent());
+      
+      if(!HistorySelect(from,to)) {
+         resp["ok"] = false;
+         resp["error"] = "HistorySelect failed";
+      } else {
+         // Group deals by position to form complete trades
+         // Structure: position_id -> { open_deal, close_deal, commission, swap, profit }
+         struct TradeData {
+            ulong positionId;
+            ulong orderTicket;
+            datetime openTime;
+            datetime closeTime;
+            int type; // DEAL_TYPE_BUY or DEAL_TYPE_SELL
+            string symbol;
+            double volume;
+            double openPrice;
+            double closePrice;
+            double commission;
+            double swap;
+            double profit;
+         };
+         
+         TradeData tradesMap[];
+         int mapSize = 0;
+         
+         int dtotal2 = HistoryDealsTotal();
+         for(int i=0;i<dtotal2;i++) {
+            ulong dticket2 = HistoryDealGetTicket(i);
+            if(dticket2<=0) continue;
+            
+            ulong posId = HistoryDealGetInteger(dticket2, DEAL_POSITION_ID);
+            if(posId == 0) continue; // Skip deals without position ID
+            
+            int dtype2 = (int)HistoryDealGetInteger(dticket2, DEAL_TYPE);
+            int entry2 = (int)HistoryDealGetInteger(dticket2, DEAL_ENTRY);
+            
+            // Find or create trade entry for this position
+            int tradeIdx = -1;
+            for(int j=0;j<mapSize;j++) {
+               if(tradesMap[j].positionId == posId) {
+                  tradeIdx = j;
+                  break;
+               }
+            }
+            
+            if(tradeIdx < 0) {
+               // New trade - initialize
+               ArrayResize(tradesMap, mapSize+1);
+               tradeIdx = mapSize;
+               tradesMap[tradeIdx].positionId = posId;
+               tradesMap[tradeIdx].orderTicket = HistoryDealGetInteger(dticket2, DEAL_ORDER);
+               tradesMap[tradeIdx].symbol = HistoryDealGetString(dticket2, DEAL_SYMBOL);
+               tradesMap[tradeIdx].volume = HistoryDealGetDouble(dticket2, DEAL_VOLUME);
+               tradesMap[tradeIdx].commission = 0.0;
+               tradesMap[tradeIdx].swap = 0.0;
+               tradesMap[tradeIdx].profit = 0.0;
+               mapSize++;
+            }
+            
+            // Accumulate swap from deal property (swap is stored in DEAL_SWAP, not as separate deal type)
+            double dealSwap = HistoryDealGetDouble(dticket2, DEAL_SWAP);
+            if(dealSwap != 0.0) {
+               tradesMap[tradeIdx].swap += dealSwap;
+            }
+            
+            // Update trade data based on deal type
+            if(dtype2 == DEAL_TYPE_BUY || dtype2 == DEAL_TYPE_SELL) {
+               if(entry2 == DEAL_ENTRY_IN) {
+                  // Opening deal
+                  tradesMap[tradeIdx].openTime = (datetime)HistoryDealGetInteger(dticket2, DEAL_TIME);
+                  tradesMap[tradeIdx].openPrice = HistoryDealGetDouble(dticket2, DEAL_PRICE);
+                  tradesMap[tradeIdx].type = dtype2;
+                  // Store order ticket for SL lookup
+                  if(tradesMap[tradeIdx].orderTicket == 0) {
+                     tradesMap[tradeIdx].orderTicket = HistoryDealGetInteger(dticket2, DEAL_ORDER);
+                  }
+               } else if(entry2 == DEAL_ENTRY_OUT) {
+                  // Closing deal
+                  tradesMap[tradeIdx].closeTime = (datetime)HistoryDealGetInteger(dticket2, DEAL_TIME);
+                  tradesMap[tradeIdx].closePrice = HistoryDealGetDouble(dticket2, DEAL_PRICE);
+                  tradesMap[tradeIdx].profit += HistoryDealGetDouble(dticket2, DEAL_PROFIT);
+               }
+            } else if(dtype2 == DEAL_TYPE_COMMISSION || dtype2 == DEAL_TYPE_COMMISSION_DAILY || dtype2 == DEAL_TYPE_COMMISSION_MONTHLY) {
+               tradesMap[tradeIdx].commission += HistoryDealGetDouble(dticket2, DEAL_PROFIT); // Commission is negative profit
+            }
+         }
+         
+         // Build response array - only include closed trades (have closeTime)
+         CJAVal trades;
+         for(int i=0;i<mapSize;i++) {
+            if(tradesMap[i].closeTime == 0) continue; // Skip open positions
+            
+            // Calculate risk per trade
+            double risk = 0.0;
+            if(tradesMap[i].orderTicket > 0) {
+               // Look up order to get stop loss
+               if(HistoryOrderSelect(tradesMap[i].orderTicket)) {
+                  double sl = HistoryOrderGetDouble(tradesMap[i].orderTicket, ORDER_SL);
+                  if(sl > 0) {
+                     string sym = tradesMap[i].symbol;
+                     double point = SymbolInfoDouble(sym, SYMBOL_POINT);
+                     double tickValue = SymbolInfoDouble(sym, SYMBOL_TRADE_TICK_VALUE);
+                     double tickSize = SymbolInfoDouble(sym, SYMBOL_TRADE_TICK_SIZE);
+                     
+                     if(tickSize > 0 && tickValue > 0) {
+                        double priceDiff = MathAbs(tradesMap[i].openPrice - sl);
+                        double ticks = priceDiff / tickSize;
+                        risk = ticks * tickValue * tradesMap[i].volume;
+                     } else {
+                        // Fallback: use point value
+                        double contractSize = SymbolInfoDouble(sym, SYMBOL_TRADE_CONTRACT_SIZE);
+                        if(contractSize > 0) {
+                           risk = MathAbs(tradesMap[i].openPrice - sl) * tradesMap[i].volume * contractSize / point;
+                        }
+                     }
+                  }
+               }
+            }
+            
+            // If risk is still 0 (no SL), use margin as proxy or calculate worst-case
+            if(risk == 0.0) {
+               // Use margin requirement as risk estimate
+               string sym = tradesMap[i].symbol;
+               double margin = SymbolInfoDouble(sym, SYMBOL_MARGIN_INITIAL);
+               if(margin > 0) {
+                  risk = margin * tradesMap[i].volume;
+               } else {
+                  // Fallback: estimate risk as 2% of entry value
+                  double contractSize = SymbolInfoDouble(sym, SYMBOL_TRADE_CONTRACT_SIZE);
+                  if(contractSize > 0) {
+                     risk = tradesMap[i].openPrice * tradesMap[i].volume * contractSize * 0.02;
+                  }
+               }
+            }
+            
+            // Calculate balance at trade open time to compute risk percentage
+            // Reconstruct balance by subtracting all balance-affecting events after open time
+            datetime openTime = tradesMap[i].openTime;
+            datetime nowdt4 = TimeCurrent();
+            double balanceAtOpen = AccountInfoDouble(ACCOUNT_BALANCE);
+            
+            // Subtract all balance-affecting events that happened after trade opened
+            if(HistorySelect(openTime, nowdt4)) {
+               int tot4 = HistoryDealsTotal();
+               for(int k=0;k<tot4;k++) {
+                  ulong deal4 = HistoryDealGetTicket(k);
+                  if(deal4<=0) continue;
+                  long ts4 = (long)HistoryDealGetInteger(deal4, DEAL_TIME);
+                  if(ts4 <= openTime) continue; // Only events after open time
+                  
+                  int dtype4 = (int)HistoryDealGetInteger(deal4, DEAL_TYPE);
+                  int entry4 = (int)HistoryDealGetInteger(deal4, DEAL_ENTRY);
+                  double pr4 = HistoryDealGetDouble(deal4, DEAL_PROFIT);
+                  
+                  // Include balance-affecting operations and realized trades
+                  bool affectBal = (dtype4 == DEAL_TYPE_BALANCE || dtype4 == DEAL_TYPE_CREDIT || dtype4 == DEAL_TYPE_CHARGE
+                                   || dtype4 == DEAL_TYPE_BONUS || dtype4 == DEAL_TYPE_COMMISSION || dtype4 == DEAL_TYPE_COMMISSION_DAILY
+                                   || dtype4 == DEAL_TYPE_COMMISSION_MONTHLY || dtype4 == DEAL_TYPE_INTEREST
+                                   || ((dtype4 == DEAL_TYPE_BUY || dtype4 == DEAL_TYPE_SELL) && entry4 == DEAL_ENTRY_OUT));
+                  if(affectBal) {
+                     balanceAtOpen -= pr4; // Subtract to get balance at open time
+                  }
+               }
+            }
+            
+            // Calculate risk as percentage of balance at open time
+            double riskPercent = 0.0;
+            if(balanceAtOpen > 0 && risk > 0) {
+               riskPercent = (risk / balanceAtOpen) * 100.0;
+            }
+            
+            CJAVal t;
+            t["open_time"] = (long)tradesMap[i].openTime;
+            t["close_time"] = (long)tradesMap[i].closeTime;
+            t["type"] = (tradesMap[i].type == DEAL_TYPE_BUY ? "BUY" : "SELL");
+            t["volume"] = tradesMap[i].volume;
+            t["symbol"] = tradesMap[i].symbol;
+            t["open_price"] = tradesMap[i].openPrice;
+            t["close_price"] = tradesMap[i].closePrice;
+            t["commission"] = tradesMap[i].commission;
+            t["swap"] = tradesMap[i].swap;
+            t["profit"] = tradesMap[i].profit;
+            t["risk"] = risk; // Absolute risk amount
+            t["risk_percent"] = riskPercent; // Risk as percentage of balance at open time
+            t["balance_at_open"] = balanceAtOpen; // Balance when trade was opened (for reference)
+            trades.Add(t);
+         }
+         resp["data"] = trades;
+      }
+   } else
+   if(action == "get_symbol_statistics") {
+      CJAVal *qp8 = query["params"];
+      long fromTs = 0;
+      long toTs = 0;
+      if(CheckPointer(qp8)!=POINTER_INVALID) {
+         CJAVal *vf8 = (*qp8)["from"];
+         CJAVal *vt8 = (*qp8)["to"];
+         if(CheckPointer(vf8)!=POINTER_INVALID) fromTs = vf8.ToInt();
+         if(CheckPointer(vt8)!=POINTER_INVALID) toTs = vt8.ToInt();
+      }
+      datetime from = (fromTs>0 ? (datetime)fromTs : (datetime)(TimeCurrent() - 30*24*60*60));
+      datetime to = (toTs>0 ? (datetime)toTs : TimeCurrent());
+      
+      if(!HistorySelect(from,to)) {
+         resp["ok"] = false;
+         resp["error"] = "HistorySelect failed";
+      } else {
+         // Group trades by symbol and calculate statistics
+         struct SymbolStats {
+            string symbol;
+            int totalTrades;
+            int profitTrades;
+            int lossTrades;
+            double totalProfit;
+            double totalLoss;
+            double grossProfit;
+            double grossLoss;
+            double netProfit;
+            double totalCommission;
+            double totalSwap;
+            double totalRisk;
+            double largestProfit;
+            double largestLoss;
+            double averageProfit;
+            double averageLoss;
+            double winRate; // percentage
+            double profitFactor;
+            double avgRiskPercent;
+         };
+         
+         SymbolStats statsMap[];
+         int statsSize = 0;
+         
+         // First, build trades map (similar to get_trade_history)
+         struct TradeData2 {
+            ulong positionId;
+            ulong orderTicket;
+            datetime openTime;
+            datetime closeTime;
+            int type;
+            string symbol;
+            double volume;
+            double openPrice;
+            double closePrice;
+            double commission;
+            double swap;
+            double profit;
+            double risk;
+            double riskPercent;
+         };
+         
+         TradeData2 tradesMap2[];
+         int mapSize2 = 0;
+         
+         int dtotal3 = HistoryDealsTotal();
+         for(int i=0;i<dtotal3;i++) {
+            ulong dticket3 = HistoryDealGetTicket(i);
+            if(dticket3<=0) continue;
+            
+            ulong posId = HistoryDealGetInteger(dticket3, DEAL_POSITION_ID);
+            if(posId == 0) continue;
+            
+            int dtype3 = (int)HistoryDealGetInteger(dticket3, DEAL_TYPE);
+            int entry3 = (int)HistoryDealGetInteger(dticket3, DEAL_ENTRY);
+            
+            int tradeIdx = -1;
+            for(int j=0;j<mapSize2;j++) {
+               if(tradesMap2[j].positionId == posId) {
+                  tradeIdx = j;
+                  break;
+               }
+            }
+            
+            if(tradeIdx < 0) {
+               ArrayResize(tradesMap2, mapSize2+1);
+               tradeIdx = mapSize2;
+               tradesMap2[tradeIdx].positionId = posId;
+               tradesMap2[tradeIdx].orderTicket = HistoryDealGetInteger(dticket3, DEAL_ORDER);
+               tradesMap2[tradeIdx].symbol = HistoryDealGetString(dticket3, DEAL_SYMBOL);
+               tradesMap2[tradeIdx].volume = HistoryDealGetDouble(dticket3, DEAL_VOLUME);
+               tradesMap2[tradeIdx].commission = 0.0;
+               tradesMap2[tradeIdx].swap = 0.0;
+               tradesMap2[tradeIdx].profit = 0.0;
+               tradesMap2[tradeIdx].risk = 0.0;
+               tradesMap2[tradeIdx].riskPercent = 0.0;
+               mapSize2++;
+            }
+            
+            double dealSwap = HistoryDealGetDouble(dticket3, DEAL_SWAP);
+            if(dealSwap != 0.0) {
+               tradesMap2[tradeIdx].swap += dealSwap;
+            }
+            
+            if(dtype3 == DEAL_TYPE_BUY || dtype3 == DEAL_TYPE_SELL) {
+               if(entry3 == DEAL_ENTRY_IN) {
+                  tradesMap2[tradeIdx].openTime = (datetime)HistoryDealGetInteger(dticket3, DEAL_TIME);
+                  tradesMap2[tradeIdx].openPrice = HistoryDealGetDouble(dticket3, DEAL_PRICE);
+                  tradesMap2[tradeIdx].type = dtype3;
+                  if(tradesMap2[tradeIdx].orderTicket == 0) {
+                     tradesMap2[tradeIdx].orderTicket = HistoryDealGetInteger(dticket3, DEAL_ORDER);
+                  }
+               } else if(entry3 == DEAL_ENTRY_OUT) {
+                  tradesMap2[tradeIdx].closeTime = (datetime)HistoryDealGetInteger(dticket3, DEAL_TIME);
+                  tradesMap2[tradeIdx].closePrice = HistoryDealGetDouble(dticket3, DEAL_PRICE);
+                  tradesMap2[tradeIdx].profit += HistoryDealGetDouble(dticket3, DEAL_PROFIT);
+               }
+            } else if(dtype3 == DEAL_TYPE_COMMISSION || dtype3 == DEAL_TYPE_COMMISSION_DAILY || dtype3 == DEAL_TYPE_COMMISSION_MONTHLY) {
+               tradesMap2[tradeIdx].commission += HistoryDealGetDouble(dticket3, DEAL_PROFIT);
+            }
+         }
+         
+         // Calculate risk for each trade and group by symbol
+         datetime nowdt5 = TimeCurrent();
+         for(int i=0;i<mapSize2;i++) {
+            if(tradesMap2[i].closeTime == 0) continue;
+            
+            // Calculate risk (same logic as get_trade_history)
+            double risk = 0.0;
+            if(tradesMap2[i].orderTicket > 0) {
+               if(HistoryOrderSelect(tradesMap2[i].orderTicket)) {
+                  double sl = HistoryOrderGetDouble(tradesMap2[i].orderTicket, ORDER_SL);
+                  if(sl > 0) {
+                     string sym = tradesMap2[i].symbol;
+                     double point = SymbolInfoDouble(sym, SYMBOL_POINT);
+                     double tickValue = SymbolInfoDouble(sym, SYMBOL_TRADE_TICK_VALUE);
+                     double tickSize = SymbolInfoDouble(sym, SYMBOL_TRADE_TICK_SIZE);
+                     
+                     if(tickSize > 0 && tickValue > 0) {
+                        double priceDiff = MathAbs(tradesMap2[i].openPrice - sl);
+                        double ticks = priceDiff / tickSize;
+                        risk = ticks * tickValue * tradesMap2[i].volume;
+                     } else {
+                        double contractSize = SymbolInfoDouble(sym, SYMBOL_TRADE_CONTRACT_SIZE);
+                        if(contractSize > 0) {
+                           risk = MathAbs(tradesMap2[i].openPrice - sl) * tradesMap2[i].volume * contractSize / point;
+                        }
+                     }
+                  }
+               }
+            }
+            
+            if(risk == 0.0) {
+               string sym = tradesMap2[i].symbol;
+               double margin = SymbolInfoDouble(sym, SYMBOL_MARGIN_INITIAL);
+               if(margin > 0) {
+                  risk = margin * tradesMap2[i].volume;
+               } else {
+                  double contractSize = SymbolInfoDouble(sym, SYMBOL_TRADE_CONTRACT_SIZE);
+                  if(contractSize > 0) {
+                     risk = tradesMap2[i].openPrice * tradesMap2[i].volume * contractSize * 0.02;
+                  }
+               }
+            }
+            
+            // Calculate balance at open and risk percent
+            datetime openTime2 = tradesMap2[i].openTime;
+            double balanceAtOpen2 = AccountInfoDouble(ACCOUNT_BALANCE);
+            if(HistorySelect(openTime2, nowdt5)) {
+               int tot5 = HistoryDealsTotal();
+               for(int k=0;k<tot5;k++) {
+                  ulong deal5 = HistoryDealGetTicket(k);
+                  if(deal5<=0) continue;
+                  long ts5 = (long)HistoryDealGetInteger(deal5, DEAL_TIME);
+                  if(ts5 <= openTime2) continue;
+                  
+                  int dtype5 = (int)HistoryDealGetInteger(deal5, DEAL_TYPE);
+                  int entry5 = (int)HistoryDealGetInteger(deal5, DEAL_ENTRY);
+                  double pr5 = HistoryDealGetDouble(deal5, DEAL_PROFIT);
+                  
+                  bool affectBal = (dtype5 == DEAL_TYPE_BALANCE || dtype5 == DEAL_TYPE_CREDIT || dtype5 == DEAL_TYPE_CHARGE
+                                   || dtype5 == DEAL_TYPE_BONUS || dtype5 == DEAL_TYPE_COMMISSION || dtype5 == DEAL_TYPE_COMMISSION_DAILY
+                                   || dtype5 == DEAL_TYPE_COMMISSION_MONTHLY || dtype5 == DEAL_TYPE_INTEREST
+                                   || ((dtype5 == DEAL_TYPE_BUY || dtype5 == DEAL_TYPE_SELL) && entry5 == DEAL_ENTRY_OUT));
+                  if(affectBal) {
+                     balanceAtOpen2 -= pr5;
+                  }
+               }
+            }
+            
+            double riskPercent2 = 0.0;
+            if(balanceAtOpen2 > 0 && risk > 0) {
+               riskPercent2 = (risk / balanceAtOpen2) * 100.0;
+            }
+            
+            tradesMap2[i].risk = risk;
+            tradesMap2[i].riskPercent = riskPercent2;
+            
+            // Find or create symbol stats entry
+            string sym2 = tradesMap2[i].symbol;
+            int statIdx = -1;
+            for(int j=0;j<statsSize;j++) {
+               if(statsMap[j].symbol == sym2) {
+                  statIdx = j;
+                  break;
+               }
+            }
+            
+            if(statIdx < 0) {
+               ArrayResize(statsMap, statsSize+1);
+               statIdx = statsSize;
+               statsMap[statIdx].symbol = sym2;
+               statsMap[statIdx].totalTrades = 0;
+               statsMap[statIdx].profitTrades = 0;
+               statsMap[statIdx].lossTrades = 0;
+               statsMap[statIdx].totalProfit = 0.0;
+               statsMap[statIdx].totalLoss = 0.0;
+               statsMap[statIdx].grossProfit = 0.0;
+               statsMap[statIdx].grossLoss = 0.0;
+               statsMap[statIdx].netProfit = 0.0;
+               statsMap[statIdx].totalCommission = 0.0;
+               statsMap[statIdx].totalSwap = 0.0;
+               statsMap[statIdx].totalRisk = 0.0;
+               statsMap[statIdx].largestProfit = 0.0;
+               statsMap[statIdx].largestLoss = 0.0;
+               statsMap[statIdx].averageProfit = 0.0;
+               statsMap[statIdx].averageLoss = 0.0;
+               statsMap[statIdx].winRate = 0.0;
+               statsMap[statIdx].profitFactor = 0.0;
+               statsMap[statIdx].avgRiskPercent = 0.0;
+               statsSize++;
+            }
+            
+            // Update statistics
+            statsMap[statIdx].totalTrades++;
+            statsMap[statIdx].totalCommission += tradesMap2[i].commission;
+            statsMap[statIdx].totalSwap += tradesMap2[i].swap;
+            statsMap[statIdx].totalRisk += tradesMap2[i].risk;
+            
+            double tradeProfit = tradesMap2[i].profit;
+            statsMap[statIdx].netProfit += tradeProfit;
+            
+            if(tradeProfit > 0) {
+               statsMap[statIdx].profitTrades++;
+               statsMap[statIdx].grossProfit += tradeProfit;
+               if(tradeProfit > statsMap[statIdx].largestProfit) {
+                  statsMap[statIdx].largestProfit = tradeProfit;
+               }
+            } else if(tradeProfit < 0) {
+               statsMap[statIdx].lossTrades++;
+               statsMap[statIdx].grossLoss += tradeProfit; // negative value
+               if(tradeProfit < statsMap[statIdx].largestLoss) {
+                  statsMap[statIdx].largestLoss = tradeProfit;
+               }
+            }
+            
+            // Accumulate risk percent for average
+            statsMap[statIdx].avgRiskPercent += tradesMap2[i].riskPercent;
+         }
+         
+         // Calculate final statistics and build response
+         CJAVal symbols;
+         for(int i=0;i<statsSize;i++) {
+            if(statsMap[i].totalTrades == 0) continue;
+            
+            // Calculate averages and ratios
+            if(statsMap[i].profitTrades > 0) {
+               statsMap[i].averageProfit = statsMap[i].grossProfit / statsMap[i].profitTrades;
+            }
+            if(statsMap[i].lossTrades > 0) {
+               statsMap[i].averageLoss = statsMap[i].grossLoss / statsMap[i].lossTrades;
+            }
+            statsMap[i].winRate = (statsMap[i].profitTrades / (double)statsMap[i].totalTrades) * 100.0;
+            statsMap[i].avgRiskPercent = statsMap[i].avgRiskPercent / statsMap[i].totalTrades;
+            
+            if(MathAbs(statsMap[i].grossLoss) > 0.0001) {
+               statsMap[i].profitFactor = MathAbs(statsMap[i].grossProfit / statsMap[i].grossLoss);
+            }
+            
+            CJAVal stat;
+            stat["symbol"] = statsMap[i].symbol;
+            stat["total_trades"] = statsMap[i].totalTrades;
+            stat["profit_trades"] = statsMap[i].profitTrades;
+            stat["loss_trades"] = statsMap[i].lossTrades;
+            stat["win_rate"] = statsMap[i].winRate;
+            stat["total_profit"] = statsMap[i].netProfit;
+            stat["gross_profit"] = statsMap[i].grossProfit;
+            stat["gross_loss"] = statsMap[i].grossLoss;
+            stat["net_profit"] = statsMap[i].netProfit;
+            stat["profit_factor"] = statsMap[i].profitFactor;
+            stat["total_commission"] = statsMap[i].totalCommission;
+            stat["total_swap"] = statsMap[i].totalSwap;
+            stat["total_risk"] = statsMap[i].totalRisk;
+            stat["average_risk_percent"] = statsMap[i].avgRiskPercent;
+            stat["largest_profit"] = statsMap[i].largestProfit;
+            stat["largest_loss"] = statsMap[i].largestLoss;
+            stat["average_profit"] = statsMap[i].averageProfit;
+            stat["average_loss"] = statsMap[i].averageLoss;
+            symbols.Add(stat);
+         }
+         
+         resp["data"] = symbols;
+      }
+   } else
+   if(action == "get_trades_minimal") {
+      CJAVal *qp9 = query["params"];
+      long fromTs = 0;
+      long toTs = 0;
+      if(CheckPointer(qp9)!=POINTER_INVALID) {
+         CJAVal *vf9 = (*qp9)["from"];
+         CJAVal *vt9 = (*qp9)["to"];
+         if(CheckPointer(vf9)!=POINTER_INVALID) fromTs = vf9.ToInt();
+         if(CheckPointer(vt9)!=POINTER_INVALID) toTs = vt9.ToInt();
+      }
+      datetime from = (fromTs>0 ? (datetime)fromTs : (datetime)(TimeCurrent() - 30*24*60*60));
+      datetime to = (toTs>0 ? (datetime)toTs : TimeCurrent());
+      
+      if(!HistorySelect(from,to)) {
+         resp["ok"] = false;
+         resp["error"] = "HistorySelect failed";
+      } else {
+         // Build minimal trade data structure for storage
+         struct MinimalTrade {
+            ulong positionId;
+            ulong orderTicket;
+            datetime openTime;
+            datetime closeTime;
+            double openPrice;
+            double closePrice;
+            double stopLoss;
+            double takeProfit;
+            string symbol;
+            int type;
+            double volume;
+            double profit;
+            double commission;
+            double swap;
+            double risk;
+            double riskPercent;
+            double balanceAtOpen;
+            string comment;
+            int dayOfWeek;
+            int hourOfDay;
+            int month;
+         };
+         
+         MinimalTrade trades[];
+         int tradesSize = 0;
+         
+         // First, group deals by position (same as get_trade_history)
+         struct TradeData3 {
+            ulong positionId;
+            ulong orderTicket;
+            datetime openTime;
+            datetime closeTime;
+            int type;
+            string symbol;
+            double volume;
+            double openPrice;
+            double closePrice;
+            double commission;
+            double swap;
+            double profit;
+         };
+         
+         TradeData3 tradesMap3[];
+         int mapSize3 = 0;
+         
+         int dtotal4 = HistoryDealsTotal();
+         for(int i=0;i<dtotal4;i++) {
+            ulong dticket4 = HistoryDealGetTicket(i);
+            if(dticket4<=0) continue;
+            
+            ulong posId = HistoryDealGetInteger(dticket4, DEAL_POSITION_ID);
+            if(posId == 0) continue;
+            
+            int dtype4 = (int)HistoryDealGetInteger(dticket4, DEAL_TYPE);
+            int entry4 = (int)HistoryDealGetInteger(dticket4, DEAL_ENTRY);
+            
+            int tradeIdx = -1;
+            for(int j=0;j<mapSize3;j++) {
+               if(tradesMap3[j].positionId == posId) {
+                  tradeIdx = j;
+                  break;
+               }
+            }
+            
+            if(tradeIdx < 0) {
+               ArrayResize(tradesMap3, mapSize3+1);
+               tradeIdx = mapSize3;
+               tradesMap3[tradeIdx].positionId = posId;
+               tradesMap3[tradeIdx].orderTicket = HistoryDealGetInteger(dticket4, DEAL_ORDER);
+               tradesMap3[tradeIdx].symbol = HistoryDealGetString(dticket4, DEAL_SYMBOL);
+               tradesMap3[tradeIdx].volume = HistoryDealGetDouble(dticket4, DEAL_VOLUME);
+               tradesMap3[tradeIdx].commission = 0.0;
+               tradesMap3[tradeIdx].swap = 0.0;
+               tradesMap3[tradeIdx].profit = 0.0;
+               mapSize3++;
+            }
+            
+            double dealSwap = HistoryDealGetDouble(dticket4, DEAL_SWAP);
+            if(dealSwap != 0.0) {
+               tradesMap3[tradeIdx].swap += dealSwap;
+            }
+            
+            if(dtype4 == DEAL_TYPE_BUY || dtype4 == DEAL_TYPE_SELL) {
+               if(entry4 == DEAL_ENTRY_IN) {
+                  tradesMap3[tradeIdx].openTime = (datetime)HistoryDealGetInteger(dticket4, DEAL_TIME);
+                  tradesMap3[tradeIdx].openPrice = HistoryDealGetDouble(dticket4, DEAL_PRICE);
+                  tradesMap3[tradeIdx].type = dtype4;
+                  if(tradesMap3[tradeIdx].orderTicket == 0) {
+                     tradesMap3[tradeIdx].orderTicket = HistoryDealGetInteger(dticket4, DEAL_ORDER);
+                  }
+               } else if(entry4 == DEAL_ENTRY_OUT) {
+                  tradesMap3[tradeIdx].closeTime = (datetime)HistoryDealGetInteger(dticket4, DEAL_TIME);
+                  tradesMap3[tradeIdx].closePrice = HistoryDealGetDouble(dticket4, DEAL_PRICE);
+                  tradesMap3[tradeIdx].profit += HistoryDealGetDouble(dticket4, DEAL_PROFIT);
+               }
+            } else if(dtype4 == DEAL_TYPE_COMMISSION || dtype4 == DEAL_TYPE_COMMISSION_DAILY || dtype4 == DEAL_TYPE_COMMISSION_MONTHLY) {
+               tradesMap3[tradeIdx].commission += HistoryDealGetDouble(dticket4, DEAL_PROFIT);
+            }
+         }
+         
+         // Build minimal data for each closed trade
+         datetime nowdt6 = TimeCurrent();
+         for(int i=0;i<mapSize3;i++) {
+            if(tradesMap3[i].closeTime == 0) continue; // Skip open positions
+            
+            ArrayResize(trades, tradesSize+1);
+            MinimalTrade &t = trades[tradesSize];
+            
+            t.positionId = tradesMap3[i].positionId;
+            t.orderTicket = tradesMap3[i].orderTicket;
+            t.openTime = tradesMap3[i].openTime;
+            t.closeTime = tradesMap3[i].closeTime;
+            t.openPrice = tradesMap3[i].openPrice;
+            t.closePrice = tradesMap3[i].closePrice;
+            t.symbol = tradesMap3[i].symbol;
+            t.type = tradesMap3[i].type;
+            t.volume = tradesMap3[i].volume;
+            t.profit = tradesMap3[i].profit;
+            t.commission = tradesMap3[i].commission;
+            t.swap = tradesMap3[i].swap;
+            t.stopLoss = 0.0;
+            t.takeProfit = 0.0;
+            t.risk = 0.0;
+            t.riskPercent = 0.0;
+            t.comment = "";
+            
+            // Get SL/TP from order
+            if(t.orderTicket > 0 && HistoryOrderSelect(t.orderTicket)) {
+               t.stopLoss = HistoryOrderGetDouble(t.orderTicket, ORDER_SL);
+               t.takeProfit = HistoryOrderGetDouble(t.orderTicket, ORDER_TP);
+               t.comment = HistoryOrderGetString(t.orderTicket, ORDER_COMMENT);
+            }
+            
+            // Calculate risk
+            if(t.stopLoss > 0) {
+               string sym = t.symbol;
+               double point = SymbolInfoDouble(sym, SYMBOL_POINT);
+               double tickValue = SymbolInfoDouble(sym, SYMBOL_TRADE_TICK_VALUE);
+               double tickSize = SymbolInfoDouble(sym, SYMBOL_TRADE_TICK_SIZE);
+               
+               if(tickSize > 0 && tickValue > 0) {
+                  double priceDiff = MathAbs(t.openPrice - t.stopLoss);
+                  double ticks = priceDiff / tickSize;
+                  t.risk = ticks * tickValue * t.volume;
+               } else {
+                  double contractSize = SymbolInfoDouble(sym, SYMBOL_TRADE_CONTRACT_SIZE);
+                  if(contractSize > 0) {
+                     t.risk = MathAbs(t.openPrice - t.stopLoss) * t.volume * contractSize / point;
+                  }
+               }
+            }
+            
+            if(t.risk == 0.0) {
+               string sym = t.symbol;
+               double margin = SymbolInfoDouble(sym, SYMBOL_MARGIN_INITIAL);
+               if(margin > 0) {
+                  t.risk = margin * t.volume;
+               } else {
+                  double contractSize = SymbolInfoDouble(sym, SYMBOL_TRADE_CONTRACT_SIZE);
+                  if(contractSize > 0) {
+                     t.risk = t.openPrice * t.volume * contractSize * 0.02;
+                  }
+               }
+            }
+            
+            // Calculate balance at open time
+            t.balanceAtOpen = AccountInfoDouble(ACCOUNT_BALANCE);
+            if(HistorySelect(t.openTime, nowdt6)) {
+               int tot6 = HistoryDealsTotal();
+               for(int k=0;k<tot6;k++) {
+                  ulong deal6 = HistoryDealGetTicket(k);
+                  if(deal6<=0) continue;
+                  long ts6 = (long)HistoryDealGetInteger(deal6, DEAL_TIME);
+                  if(ts6 <= t.openTime) continue;
+                  
+                  int dtype6 = (int)HistoryDealGetInteger(deal6, DEAL_TYPE);
+                  int entry6 = (int)HistoryDealGetInteger(deal6, DEAL_ENTRY);
+                  double pr6 = HistoryDealGetDouble(deal6, DEAL_PROFIT);
+                  
+                  bool affectBal = (dtype6 == DEAL_TYPE_BALANCE || dtype6 == DEAL_TYPE_CREDIT || dtype6 == DEAL_TYPE_CHARGE
+                                   || dtype6 == DEAL_TYPE_BONUS || dtype6 == DEAL_TYPE_COMMISSION || dtype6 == DEAL_TYPE_COMMISSION_DAILY
+                                   || dtype6 == DEAL_TYPE_COMMISSION_MONTHLY || dtype6 == DEAL_TYPE_INTEREST
+                                   || ((dtype6 == DEAL_TYPE_BUY || dtype6 == DEAL_TYPE_SELL) && entry6 == DEAL_ENTRY_OUT));
+                  if(affectBal) {
+                     t.balanceAtOpen -= pr6;
+                  }
+               }
+            }
+            
+            // Calculate risk percent
+            if(t.balanceAtOpen > 0 && t.risk > 0) {
+               t.riskPercent = (t.risk / t.balanceAtOpen) * 100.0;
+            }
+            
+            // Extract time components
+            MqlDateTime dtOpen;
+            TimeToStruct(t.openTime, dtOpen);
+            t.dayOfWeek = dtOpen.day_of_week; // 0=Sunday, 1=Monday, etc.
+            t.hourOfDay = dtOpen.hour;
+            t.month = dtOpen.mon;
+            
+            tradesSize++;
+         }
+         
+         // Build JSON response
+         CJAVal tradesArray;
+         for(int i=0;i<tradesSize;i++) {
+            CJAVal t;
+            t["position_id"] = (long)trades[i].positionId;
+            t["order_ticket"] = (long)trades[i].orderTicket;
+            t["open_time"] = (long)trades[i].openTime;
+            t["close_time"] = (long)trades[i].closeTime;
+            t["open_price"] = trades[i].openPrice;
+            t["close_price"] = trades[i].closePrice;
+            t["stop_loss"] = trades[i].stopLoss;
+            t["take_profit"] = trades[i].takeProfit;
+            t["symbol"] = trades[i].symbol;
+            t["type"] = (trades[i].type == DEAL_TYPE_BUY ? "BUY" : "SELL");
+            t["volume"] = trades[i].volume;
+            t["profit"] = trades[i].profit;
+            t["commission"] = trades[i].commission;
+            t["swap"] = trades[i].swap;
+            t["risk"] = trades[i].risk;
+            t["risk_percent"] = trades[i].riskPercent;
+            t["balance_at_open"] = trades[i].balanceAtOpen;
+            t["comment"] = trades[i].comment;
+            t["day_of_week"] = trades[i].dayOfWeek;
+            t["hour_of_day"] = trades[i].hourOfDay;
+            t["month"] = trades[i].month;
+            tradesArray.Add(t);
+         }
+         
+         resp["data"] = tradesArray;
+      }
    } else {
       handled = false;
       resp["ok"] = false;
