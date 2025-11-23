@@ -372,7 +372,7 @@ void SendQuickUpdate() {
       data["margin"] = currentMargin;
    }
    
-   SendData(data.Serialize());
+   // SendData(data.Serialize());
    
    // Update tracking
    lastEquity = AccountInfoDouble(ACCOUNT_EQUITY);
@@ -391,6 +391,9 @@ void SendPositionsUpdate() {
    data["login"] = (string)AccountInfoInteger(ACCOUNT_LOGIN);  // ✅ STRING
    data["timestamp"] = GetCurrentTimestamp();  // ✅ TIMESTAMP
    data["positions"];
+   data["balance"] = AccountInfoDouble(ACCOUNT_BALANCE);
+   data["equity"] = AccountInfoDouble(ACCOUNT_EQUITY);
+   data["profit"] = AccountInfoDouble(ACCOUNT_PROFIT);
    
    for(int i = 0; i < PositionsTotal(); i++) {
       ulong ticket = PositionGetTicket(i);
