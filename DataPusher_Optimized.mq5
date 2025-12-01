@@ -12,6 +12,10 @@
 int setsockopt(SOCKET64 s, int level, int optname, int &optval, int optlen);
 #import
 
+// Version information
+#define EXPERT_VERSION "1.0.0"
+#define EXPERT_BUILD_DATE __DATE__
+
 // Socket option constants
 #define SOL_SOCKET 0xFFFF
 #define SO_KEEPALIVE 0x0008
@@ -78,6 +82,13 @@ void SendHeartbeat();
 //| Expert initialization function                                     |
 //+------------------------------------------------------------------+
 int OnInit() {
+   // Log version information first
+   Print("========================================");
+   Print("DataPusher Optimized Expert Advisor");
+   Print("Version: ", EXPERT_VERSION);
+   Print("Build Date: ", EXPERT_BUILD_DATE);
+   Print("========================================");
+   
    expertStatus = STATUS_CONNECTING;
    ConnectSocket();
    
