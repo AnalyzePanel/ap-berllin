@@ -1259,6 +1259,26 @@ void HandleQuery(CJAVal &query) {
                baseBalFrom -= prb;
             }
          }
+         
+         // Calculate initial deposit (init balance) from full history
+         double initDeposit = AccountInfoDouble(ACCOUNT_BALANCE);
+         datetime accountStart = 0; // Start from account creation
+         if(HistorySelect(accountStart, nowdt3)) {
+            int totInit = HistoryDealsTotal();
+            for(int i=0;i<totInit;i++) {
+               ulong dealInit = HistoryDealGetTicket(i);
+               if(dealInit<=0) continue;
+               int dtbInit = (int)HistoryDealGetInteger(dealInit, DEAL_TYPE);
+               int enbInit = (int)HistoryDealGetInteger(dealInit, DEAL_ENTRY);
+               double prbInit = HistoryDealGetDouble(dealInit, DEAL_PROFIT);
+               bool affectInit = (dtbInit == DEAL_TYPE_BALANCE || dtbInit == DEAL_TYPE_CREDIT || dtbInit == DEAL_TYPE_CHARGE
+                                  || dtbInit == DEAL_TYPE_BONUS || dtbInit == DEAL_TYPE_COMMISSION || dtbInit == DEAL_TYPE_COMMISSION_DAILY
+                                  || dtbInit == DEAL_TYPE_COMMISSION_MONTHLY || dtbInit == DEAL_TYPE_INTEREST
+                                  || ((dtbInit == DEAL_TYPE_BUY || dtbInit == DEAL_TYPE_SELL) && enbInit == DEAL_ENTRY_OUT));
+               if(!affectInit) continue;
+               initDeposit -= prbInit;
+            }
+         }
 
          // Re-select [from,to] for stats processing
          HistorySelect(from,to);
@@ -1293,6 +1313,21 @@ void HandleQuery(CJAVal &query) {
          double eqCurve = baseBalFrom;
          double peak = eqCurve;
          double maxDdAbs = 0.0;
+
+         // Daily and total drawdown tracking
+         // Use init deposit as initial balance
+         double initialBalance = initDeposit;
+         double dailyStartBalance = 0.0;
+         double dailyPeak = 0.0;
+         double dailyMin = 0.0;
+         double overallMin = initDeposit;
+         double maxDailyDrawdown = 0.0;
+         double maxTotalDrawdown = 0.0;
+         double maxDailyDrawdownPercent = 0.0;
+         double maxTotalDrawdownPercent = 0.0;
+         int currentDay = -1;
+         double lastDailyStartBalance = 0.0;
+         bool dailyInitialized = false;
 
          ArrayResize(profits, nt);
          for(int i=0;i<nt;i++) {
@@ -1329,11 +1364,99 @@ void HandleQuery(CJAVal &query) {
                curWinSum = 0.0;
             }
 
-            // equity curve and drawdown
+            // Check for day change BEFORE applying profit
+            MqlDateTime tradeDate;
+            TimeToStruct((datetime)tdeals[i].t, tradeDate);
+            int tradeDay = tradeDate.year * 10000 + tradeDate.mon * 100 + tradeDate.day;
+            
+            // Check for day change and set daily start balance BEFORE applying profit
+            if(currentDay == -1) {
+               // First trade - initialize daily tracking with balance BEFORE this trade
+               currentDay = tradeDay;
+               dailyStartBalance = eqCurve; // Balance before first trade (start of day)
+               dailyPeak = eqCurve;
+               dailyMin = eqCurve;
+               lastDailyStartBalance = dailyStartBalance;
+               dailyInitialized = true;
+            } else if(tradeDay != currentDay) {
+               // Day changed - reset daily tracking for new day
+               // Use balance BEFORE first trade of new day as start of new day
+               currentDay = tradeDay;
+               dailyStartBalance = eqCurve; // Balance at start of new day (before first trade of new day)
+               dailyPeak = eqCurve;
+               dailyMin = eqCurve;
+               lastDailyStartBalance = dailyStartBalance;
+            }
+            
+            // Apply profit to equity curve
             eqCurve += pr;
+            
+            // Update daily peak and minimum
+            if(eqCurve > dailyPeak) dailyPeak = eqCurve;
+            if(eqCurve < dailyMin) dailyMin = eqCurve;
+            
+            // Update overall minimum
+            if(eqCurve < overallMin) overallMin = eqCurve;
+            
+            // Calculate daily drawdown (from daily start balance)
+            // Daily drawdown = drop from daily start balance
+            double dailyDD = dailyStartBalance - eqCurve;
+            if(dailyDD > maxDailyDrawdown) {
+               maxDailyDrawdown = dailyDD;
+               // Calculate percentage for this drawdown
+               if(dailyStartBalance > 0.0) {
+                  double dailyDDPercent = (dailyDD / dailyStartBalance) * 100.0;
+                  if(dailyDDPercent > maxDailyDrawdownPercent) {
+                     maxDailyDrawdownPercent = dailyDDPercent;
+                  }
+               }
+            }
+            
+            // Calculate total drawdown (from initial balance)
+            double totalDD = initialBalance - eqCurve;
+            if(totalDD > maxTotalDrawdown) {
+               maxTotalDrawdown = totalDD;
+               // Calculate percentage for this drawdown
+               if(initialBalance > 0.0) {
+                  double totalDDPercent = (totalDD / initialBalance) * 100.0;
+                  if(totalDDPercent > maxTotalDrawdownPercent) {
+                     maxTotalDrawdownPercent = totalDDPercent;
+                  }
+               }
+            }
+            
+            // Original drawdown calculation (from overall peak)
             if(eqCurve > peak) peak = eqCurve;
             double dd = peak - eqCurve;
             if(dd > maxDdAbs) maxDdAbs = dd;
+         }
+
+         // Calculate final daily drawdown for the last day (from daily start balance)
+         if(dailyInitialized) {
+            double lastDailyDD = dailyStartBalance - dailyMin;
+            if(lastDailyDD > maxDailyDrawdown) {
+               maxDailyDrawdown = lastDailyDD;
+               // Calculate percentage for this drawdown
+               if(dailyStartBalance > 0.0) {
+                  double dailyDDPercent = (lastDailyDD / dailyStartBalance) * 100.0;
+                  if(dailyDDPercent > maxDailyDrawdownPercent) {
+                     maxDailyDrawdownPercent = dailyDDPercent;
+                  }
+               }
+            }
+         }
+         
+         // Calculate final total drawdown
+         double lastTotalDD = initialBalance - overallMin;
+         if(lastTotalDD > maxTotalDrawdown) {
+            maxTotalDrawdown = lastTotalDD;
+            // Calculate percentage for this drawdown
+            if(initialBalance > 0.0) {
+               double totalDDPercent = (lastTotalDD / initialBalance) * 100.0;
+               if(totalDDPercent > maxTotalDrawdownPercent) {
+                  maxTotalDrawdownPercent = totalDDPercent;
+               }
+            }
          }
 
          // Balance drawdown metrics
@@ -1342,6 +1465,57 @@ void HandleQuery(CJAVal &query) {
          rep["balance_drawdown_absolute"] = ddAbs;
          rep["balance_drawdown_maximal"] = ddAbs;
          rep["balance_drawdown_relative_percent"] = ddRel;
+         
+         // Calculate today's daily start balance
+         // If there are trades today, subtract today's profits from current balance to get yesterday's last balance
+         // If no trades today, current balance is daily start balance
+         MqlDateTime todayDate;
+         TimeCurrent(todayDate);
+         int todayDay = todayDate.year * 10000 + todayDate.mon * 100 + todayDate.day;
+         datetime todayStart = StringToTime(StringFormat("%04d.%02d.%02d 00:00:00", todayDate.year, todayDate.mon, todayDate.day));
+         datetime todayEnd = TimeCurrent();
+         
+         double todayDailyStartBalance = AccountInfoDouble(ACCOUNT_BALANCE);
+         bool hasTradesToday = false;
+         
+         // Check if there are trades today
+         if(HistorySelect(todayStart, todayEnd)) {
+            int todayDealsTotal = HistoryDealsTotal();
+            for(int i=0;i<todayDealsTotal;i++) {
+               ulong dealToday = HistoryDealGetTicket(i);
+               if(dealToday<=0) continue;
+               int dtypeToday = (int)HistoryDealGetInteger(dealToday, DEAL_TYPE);
+               int entryToday = (int)HistoryDealGetInteger(dealToday, DEAL_ENTRY);
+               double prToday = HistoryDealGetDouble(dealToday, DEAL_PROFIT);
+               bool affectToday = (dtypeToday == DEAL_TYPE_BALANCE || dtypeToday == DEAL_TYPE_CREDIT || dtypeToday == DEAL_TYPE_CHARGE
+                                  || dtypeToday == DEAL_TYPE_BONUS || dtypeToday == DEAL_TYPE_COMMISSION || dtypeToday == DEAL_TYPE_COMMISSION_DAILY
+                                  || dtypeToday == DEAL_TYPE_COMMISSION_MONTHLY || dtypeToday == DEAL_TYPE_INTEREST
+                                  || ((dtypeToday == DEAL_TYPE_BUY || dtypeToday == DEAL_TYPE_SELL) && entryToday == DEAL_ENTRY_OUT));
+               if(!affectToday) continue;
+               hasTradesToday = true;
+               // Subtract today's profit to get balance at start of today (end of yesterday)
+               todayDailyStartBalance -= prToday;
+            }
+         }
+         
+         // If we have a calculated daily start balance from the loop and it's for today, use it
+         // Otherwise use the calculated value from today's trades
+         if(dailyInitialized && currentDay == todayDay) {
+            // Use the daily start balance from the loop (before first trade of today)
+            rep["daily_start_balance"] = lastDailyStartBalance;
+         } else if(hasTradesToday) {
+            // Use calculated balance from subtracting today's trades
+            rep["daily_start_balance"] = todayDailyStartBalance;
+         } else {
+            // No trades today, current balance is daily start balance
+            rep["daily_start_balance"] = AccountInfoDouble(ACCOUNT_BALANCE);
+         }
+         
+         // Daily and total drawdown metrics (in percent)
+         // Use the maximum percentage calculated during the loop
+         rep["daily_drawdown_max"] = maxDailyDrawdownPercent;
+         rep["total_drawdown_max"] = maxTotalDrawdownPercent;
+         rep["initial_balance"] = initialBalance;
 
          // Basic profit stats
          rep["total_net_profit"] = netProfit;
