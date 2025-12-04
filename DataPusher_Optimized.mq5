@@ -77,6 +77,10 @@ bool HasOrdersChanged();
 string CalculatePositionsHash();
 string CalculateOrdersHash();
 void SendHeartbeat();
+void UpdateDailyStartBalance();
+string GetDailyStartBalanceVarName(string login, int date);
+double GetDailyStartBalance(string login, int date);
+void SetDailyStartBalance(string login, int date, double balance);
 
 //+------------------------------------------------------------------+
 //| Expert initialization function                                     |
@@ -103,6 +107,9 @@ int OnInit() {
    lastDataSent = TimeCurrent();
    lastPositionsHash = CalculatePositionsHash();
    lastOrdersHash = CalculateOrdersHash();
+   
+   // Initialize daily start balance (using terminal global variables)
+   UpdateDailyStartBalance();
    
    // Send initial full snapshot
    if(IsSocketConnected()) {
@@ -163,7 +170,10 @@ void OnTick() {
    // Note: Removed aggressive health check using recv() as it was causing disconnections
    // Connection health will be detected by send() errors instead
    
-   // -1. Poll for incoming server queries (non-blocking)
+   // -1. Check and update daily start balance if day changed
+   UpdateDailyStartBalance();
+   
+   // -2. Poll for incoming server queries (non-blocking)
    PollIncoming();
    
    // 0. Send heartbeat if idle too long (prevents connection timeout)
@@ -625,6 +635,53 @@ void SendHeartbeat() {
 }
 
 //+------------------------------------------------------------------+
+//| Get global variable name for daily start balance                  |
+//+------------------------------------------------------------------+
+string GetDailyStartBalanceVarName(string login, int date) {
+   return "DailyStartBalance_" + login + "_" + IntegerToString(date);
+}
+
+//+------------------------------------------------------------------+
+//| Get daily start balance from terminal global variable             |
+//+------------------------------------------------------------------+
+double GetDailyStartBalance(string login, int date) {
+   string varName = GetDailyStartBalanceVarName(login, date);
+   if(GlobalVariableCheck(varName)) {
+      return GlobalVariableGet(varName);
+   }
+   return 0.0;
+}
+
+//+------------------------------------------------------------------+
+//| Set daily start balance to terminal global variable               |
+//+------------------------------------------------------------------+
+void SetDailyStartBalance(string login, int date, double balance) {
+   string varName = GetDailyStartBalanceVarName(login, date);
+   GlobalVariableSet(varName, balance);
+   GlobalVariablesFlush(); // Force save to disk
+}
+
+//+------------------------------------------------------------------+
+//| Update daily start balance if day changed or not initialized      |
+//+------------------------------------------------------------------+
+void UpdateDailyStartBalance() {
+   string currentLogin = (string)AccountInfoInteger(ACCOUNT_LOGIN);
+   MqlDateTime dt;
+   TimeCurrent(dt);
+   int currentDate = dt.year * 10000 + dt.mon * 100 + dt.day;
+   
+   string varName = GetDailyStartBalanceVarName(currentLogin, currentDate);
+   double currentBalance = AccountInfoDouble(ACCOUNT_BALANCE);
+   
+   // Check if global variable exists for today
+   // If it doesn't exist, it means it's a new day or first run - save current balance
+   if(!GlobalVariableCheck(varName)) {
+      SetDailyStartBalance(currentLogin, currentDate, currentBalance);
+      Print("📅 Daily start balance updated: login=", currentLogin, " | date=", currentDate, " | balance=", currentBalance);
+   }
+}
+
+//+------------------------------------------------------------------+
 //| Error handling function                                            |
 //+------------------------------------------------------------------+
 void ProcessSocketError(string functionName, int errorCode) {
@@ -810,6 +867,21 @@ void HandleQuery(CJAVal &query) {
       acc["currency"] = AccountInfoString(ACCOUNT_CURRENCY);
       acc["leverage"] = (int)AccountInfoInteger(ACCOUNT_LEVERAGE);
       resp["data"] = acc;
+   } else
+   if(action == "get_daily_start_balance") {
+      // Return today's start balance from terminal global variable
+      UpdateDailyStartBalance(); // Ensure it's up to date
+      string currentLogin = (string)AccountInfoInteger(ACCOUNT_LOGIN);
+      MqlDateTime dt;
+      TimeCurrent(dt);
+      int currentDate = dt.year * 10000 + dt.mon * 100 + dt.day;
+      double balance = GetDailyStartBalance(currentLogin, currentDate);
+      
+      CJAVal data;
+      data["login"] = currentLogin;
+      data["date"] = currentDate;
+      data["balance"] = balance;
+      resp["data"] = data;
    } else
    if(action == "get_positions") {
       CJAVal arr;
@@ -1260,26 +1332,6 @@ void HandleQuery(CJAVal &query) {
             }
          }
          
-         // Calculate initial deposit (init balance) from full history
-         double initDeposit = AccountInfoDouble(ACCOUNT_BALANCE);
-         datetime accountStart = 0; // Start from account creation
-         if(HistorySelect(accountStart, nowdt3)) {
-            int totInit = HistoryDealsTotal();
-            for(int i=0;i<totInit;i++) {
-               ulong dealInit = HistoryDealGetTicket(i);
-               if(dealInit<=0) continue;
-               int dtbInit = (int)HistoryDealGetInteger(dealInit, DEAL_TYPE);
-               int enbInit = (int)HistoryDealGetInteger(dealInit, DEAL_ENTRY);
-               double prbInit = HistoryDealGetDouble(dealInit, DEAL_PROFIT);
-               bool affectInit = (dtbInit == DEAL_TYPE_BALANCE || dtbInit == DEAL_TYPE_CREDIT || dtbInit == DEAL_TYPE_CHARGE
-                                  || dtbInit == DEAL_TYPE_BONUS || dtbInit == DEAL_TYPE_COMMISSION || dtbInit == DEAL_TYPE_COMMISSION_DAILY
-                                  || dtbInit == DEAL_TYPE_COMMISSION_MONTHLY || dtbInit == DEAL_TYPE_INTEREST
-                                  || ((dtbInit == DEAL_TYPE_BUY || dtbInit == DEAL_TYPE_SELL) && enbInit == DEAL_ENTRY_OUT));
-               if(!affectInit) continue;
-               initDeposit -= prbInit;
-            }
-         }
-
          // Re-select [from,to] for stats processing
          HistorySelect(from,to);
 
@@ -1315,12 +1367,12 @@ void HandleQuery(CJAVal &query) {
          double maxDdAbs = 0.0;
 
          // Daily and total drawdown tracking
-         // Use init deposit as initial balance
-         double initialBalance = initDeposit;
+         // Use base balance at 'from' as initial balance
+         double initialBalance = baseBalFrom;
          double dailyStartBalance = 0.0;
          double dailyPeak = 0.0;
          double dailyMin = 0.0;
-         double overallMin = initDeposit;
+         double overallMin = baseBalFrom;
          double maxDailyDrawdown = 0.0;
          double maxTotalDrawdown = 0.0;
          double maxDailyDrawdownPercent = 0.0;
@@ -1466,56 +1518,19 @@ void HandleQuery(CJAVal &query) {
          rep["balance_drawdown_maximal"] = ddAbs;
          rep["balance_drawdown_relative_percent"] = ddRel;
          
-         // Calculate today's daily start balance
-         // If there are trades today, subtract today's profits from current balance to get yesterday's last balance
-         // If no trades today, current balance is daily start balance
-         MqlDateTime todayDate;
-         TimeCurrent(todayDate);
-         int todayDay = todayDate.year * 10000 + todayDate.mon * 100 + todayDate.day;
-         datetime todayStart = StringToTime(StringFormat("%04d.%02d.%02d 00:00:00", todayDate.year, todayDate.mon, todayDate.day));
-         datetime todayEnd = TimeCurrent();
-         
-         double todayDailyStartBalance = AccountInfoDouble(ACCOUNT_BALANCE);
-         bool hasTradesToday = false;
-         
-         // Check if there are trades today
-         if(HistorySelect(todayStart, todayEnd)) {
-            int todayDealsTotal = HistoryDealsTotal();
-            for(int i=0;i<todayDealsTotal;i++) {
-               ulong dealToday = HistoryDealGetTicket(i);
-               if(dealToday<=0) continue;
-               int dtypeToday = (int)HistoryDealGetInteger(dealToday, DEAL_TYPE);
-               int entryToday = (int)HistoryDealGetInteger(dealToday, DEAL_ENTRY);
-               double prToday = HistoryDealGetDouble(dealToday, DEAL_PROFIT);
-               bool affectToday = (dtypeToday == DEAL_TYPE_BALANCE || dtypeToday == DEAL_TYPE_CREDIT || dtypeToday == DEAL_TYPE_CHARGE
-                                  || dtypeToday == DEAL_TYPE_BONUS || dtypeToday == DEAL_TYPE_COMMISSION || dtypeToday == DEAL_TYPE_COMMISSION_DAILY
-                                  || dtypeToday == DEAL_TYPE_COMMISSION_MONTHLY || dtypeToday == DEAL_TYPE_INTEREST
-                                  || ((dtypeToday == DEAL_TYPE_BUY || dtypeToday == DEAL_TYPE_SELL) && entryToday == DEAL_ENTRY_OUT));
-               if(!affectToday) continue;
-               hasTradesToday = true;
-               // Subtract today's profit to get balance at start of today (end of yesterday)
-               todayDailyStartBalance -= prToday;
-            }
-         }
-         
-         // If we have a calculated daily start balance from the loop and it's for today, use it
-         // Otherwise use the calculated value from today's trades
-         if(dailyInitialized && currentDay == todayDay) {
-            // Use the daily start balance from the loop (before first trade of today)
-            rep["daily_start_balance"] = lastDailyStartBalance;
-         } else if(hasTradesToday) {
-            // Use calculated balance from subtracting today's trades
-            rep["daily_start_balance"] = todayDailyStartBalance;
-         } else {
-            // No trades today, current balance is daily start balance
-            rep["daily_start_balance"] = AccountInfoDouble(ACCOUNT_BALANCE);
-         }
+         // Use terminal global variable for daily start balance
+         UpdateDailyStartBalance(); // Ensure it's up to date
+         string currentLogin = (string)AccountInfoInteger(ACCOUNT_LOGIN);
+         MqlDateTime todayDt;
+         TimeCurrent(todayDt);
+         int todayDate = todayDt.year * 10000 + todayDt.mon * 100 + todayDt.day;
+         double todayStartBalance = GetDailyStartBalance(currentLogin, todayDate);
+         rep["daily_start_balance"] = todayStartBalance;
          
          // Daily and total drawdown metrics (in percent)
          // Use the maximum percentage calculated during the loop
          rep["daily_drawdown_max"] = maxDailyDrawdownPercent;
          rep["total_drawdown_max"] = maxTotalDrawdownPercent;
-         rep["initial_balance"] = initialBalance;
 
          // Basic profit stats
          rep["total_net_profit"] = netProfit;
