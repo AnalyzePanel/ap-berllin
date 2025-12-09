@@ -59,6 +59,17 @@ string lastOrdersHash = "";
 // Incoming data buffer
 string recvBuffer = "";
 
+// Rules variables
+double maxDailyDrawdownPercent = 0.0;    // MAX_DAILY_DRAWDOWN_PERCENT
+double maxTotalDrawdownPercent = 0.0;    // MAX_TOTAL_DRAWDOWN_PERCENT
+double floatingRiskPercent = 0.0;        // FLOATING_RISK_PERCENT
+double marathonStartBalance = 0.0;       // Marathon start balance for total drawdown calculation
+datetime lastRuleCheckTime = 0;          // Last time rules were checked
+string failedRules = "";                 // Comma-separated list of failed rule types
+string failedReasons = "";               // Comma-separated list of failure reasons
+bool rulesInitialized = false;           // Whether rules have been set
+bool rulesWerePassing = true;            // Track if rules were passing on last check (for violation alerts)
+
 // Forward declarations
 void SendAccountSnapshot();
 void SendQuickUpdate();
@@ -81,6 +92,14 @@ void UpdateDailyStartBalance();
 string GetDailyStartBalanceVarName(string login, int date);
 double GetDailyStartBalance(string login, int date);
 void SetDailyStartBalance(string login, int date, double balance);
+void SetRules(CJAVal &rulesArray);
+void GetRulesStatus(CJAVal &status);
+void CheckRulesStatus();
+string GetRuleFailureReason(string ruleType, double currentValue, double limit);
+double GetCurrentDailyDrawdownPercent();
+double GetCurrentTotalDrawdownPercent();
+double GetCurrentFloatingRiskPercent();
+void SendRuleViolationAlert(string alertFailedRules, string alertFailedReasons);
 
 //+------------------------------------------------------------------+
 //| Expert initialization function                                     |
@@ -172,8 +191,13 @@ void OnTick() {
    
    // -1. Check and update daily start balance if day changed
    UpdateDailyStartBalance();
-   
-   // -2. Poll for incoming server queries (non-blocking)
+
+   // -2. Check rules status on every tick (if rules are initialized)
+   if(rulesInitialized) {
+      CheckRulesStatus();
+   }
+
+   // -3. Poll for incoming server queries (non-blocking)
    PollIncoming();
    
    // 0. Send heartbeat if idle too long (prevents connection timeout)
@@ -827,7 +851,13 @@ void HandleIncomingMessage(const string message) {
 void HandleQuery(CJAVal &query) {
    CJAVal *reqIdPtr = query["requestId"];
    CJAVal *actionPtr = query["action"];
-   string requestId = (reqIdPtr != NULL ? reqIdPtr.ToStr() : "");
+   string requestId = "";
+   if(CheckPointer(reqIdPtr) != POINTER_INVALID && reqIdPtr != NULL) {
+      requestId = reqIdPtr.ToStr();
+   } else {
+      // Defensive: keep empty but log to ease tracing when requestId is missing
+      Print("⚠️ Query received without valid requestId pointer, echoing empty requestId");
+   }
    string action = (actionPtr != NULL ? actionPtr.ToStr() : "");
    
    // Log action, requestId and lightweight params preview
@@ -1375,8 +1405,8 @@ void HandleQuery(CJAVal &query) {
          double overallMin = baseBalFrom;
          double maxDailyDrawdown = 0.0;
          double maxTotalDrawdown = 0.0;
-         double maxDailyDrawdownPercent = 0.0;
-         double maxTotalDrawdownPercent = 0.0;
+         double localMaxDailyDrawdownPercent = 0.0;
+         double localMaxTotalDrawdownPercent = 0.0;
          int currentDay = -1;
          double lastDailyStartBalance = 0.0;
          bool dailyInitialized = false;
@@ -1458,8 +1488,8 @@ void HandleQuery(CJAVal &query) {
                // Calculate percentage for this drawdown
                if(dailyStartBalance > 0.0) {
                   double dailyDDPercent = (dailyDD / dailyStartBalance) * 100.0;
-                  if(dailyDDPercent > maxDailyDrawdownPercent) {
-                     maxDailyDrawdownPercent = dailyDDPercent;
+                  if(dailyDDPercent > localMaxDailyDrawdownPercent) {
+                     localMaxDailyDrawdownPercent = dailyDDPercent;
                   }
                }
             }
@@ -1471,8 +1501,8 @@ void HandleQuery(CJAVal &query) {
                // Calculate percentage for this drawdown
                if(initialBalance > 0.0) {
                   double totalDDPercent = (totalDD / initialBalance) * 100.0;
-                  if(totalDDPercent > maxTotalDrawdownPercent) {
-                     maxTotalDrawdownPercent = totalDDPercent;
+                  if(totalDDPercent > localMaxTotalDrawdownPercent) {
+                     localMaxTotalDrawdownPercent = totalDDPercent;
                   }
                }
             }
@@ -1491,8 +1521,8 @@ void HandleQuery(CJAVal &query) {
                // Calculate percentage for this drawdown
                if(dailyStartBalance > 0.0) {
                   double dailyDDPercent = (lastDailyDD / dailyStartBalance) * 100.0;
-                  if(dailyDDPercent > maxDailyDrawdownPercent) {
-                     maxDailyDrawdownPercent = dailyDDPercent;
+                  if(dailyDDPercent > localMaxDailyDrawdownPercent) {
+                     localMaxDailyDrawdownPercent = dailyDDPercent;
                   }
                }
             }
@@ -1505,8 +1535,8 @@ void HandleQuery(CJAVal &query) {
             // Calculate percentage for this drawdown
             if(initialBalance > 0.0) {
                double totalDDPercent = (lastTotalDD / initialBalance) * 100.0;
-               if(totalDDPercent > maxTotalDrawdownPercent) {
-                  maxTotalDrawdownPercent = totalDDPercent;
+               if(totalDDPercent > localMaxTotalDrawdownPercent) {
+                  localMaxTotalDrawdownPercent = totalDDPercent;
                }
             }
          }
@@ -1529,8 +1559,8 @@ void HandleQuery(CJAVal &query) {
          
          // Daily and total drawdown metrics (in percent)
          // Use the maximum percentage calculated during the loop
-         rep["daily_drawdown_max"] = maxDailyDrawdownPercent;
-         rep["total_drawdown_max"] = maxTotalDrawdownPercent;
+         rep["daily_drawdown_max"] = localMaxDailyDrawdownPercent;
+         rep["total_drawdown_max"] = localMaxTotalDrawdownPercent;
 
          // Basic profit stats
          rep["total_net_profit"] = netProfit;
@@ -2425,6 +2455,54 @@ void HandleQuery(CJAVal &query) {
          
          resp["data"] = tradesArray;
       }
+   } else
+   if(action == "set_rules") {
+      // Set marathon validation rules
+      CJAVal *rulesPtr = query["params"]["rules"];
+      if(CheckPointer(rulesPtr) != POINTER_INVALID && (*rulesPtr).m_type == jtARRAY) {
+         SetRules(rulesPtr);
+         CJAVal data;
+         data["message"] = "Rules set successfully";
+         resp["data"] = data;
+         Print("✅ Rules set successfully");
+      } else {
+         resp["ok"] = false;
+         resp["error"] = "Invalid rules format";
+         Print("⚠️ Invalid rules format");
+      }
+   } else
+   if(action == "get_rules_status") {
+      // Get current rules status
+      CJAVal status;
+      GetRulesStatus(status);
+      resp["data"] = status;
+      Print("✅ Rules status retrieved");
+   } else
+   if(action == "set_marathon_start_balance") {
+      // Set marathon start balance for total drawdown calculation
+      CJAVal *paramsPtr = query["params"];
+      double balance = 0.0;
+
+      if(CheckPointer(paramsPtr) != POINTER_INVALID) {
+         CJAVal *balPtr = (*paramsPtr)["balance"];
+         if(CheckPointer(balPtr) != POINTER_INVALID) {
+            balance = balPtr.ToDbl();
+         }
+      }
+
+      // If balance not provided, use current balance
+      if(balance <= 0.0) {
+         balance = AccountInfoDouble(ACCOUNT_BALANCE);
+      }
+
+      marathonStartBalance = balance;
+
+      CJAVal data;
+      data["message"] = "Marathon start balance set successfully";
+      data["balance"] = balance;
+      resp["data"] = data;
+
+      Print("✅ Marathon start balance set to ", DoubleToString(balance, 2));
    } else {
       handled = false;
       resp["ok"] = false;
@@ -2438,4 +2516,237 @@ void HandleQuery(CJAVal &query) {
       Print("⚠️ Unknown query action | action=", action, " | requestId=", requestId);
       SendData(resp.Serialize());
    }
+}
+
+//+------------------------------------------------------------------+
+//| Set marathon validation rules                                    |
+//+------------------------------------------------------------------+
+void SetRules(CJAVal &rulesArray) {
+   // Reset rules
+   maxDailyDrawdownPercent = 0.0;
+   maxTotalDrawdownPercent = 0.0;
+   floatingRiskPercent = 0.0;
+   rulesInitialized = false;
+   failedRules = "";
+   failedReasons = "";
+
+   int rulesCount = rulesArray.Size();
+   for(int i = 0; i < rulesCount; i++) {
+      CJAVal rule = rulesArray[i];
+      string ruleType = rule["type"].ToStr();
+      double limit = rule["limit"].ToDbl();
+
+      if(ruleType == "MAX_DAILY_DRAWDOWN_PERCENT") {
+         maxDailyDrawdownPercent = limit;
+      } else if(ruleType == "MAX_TOTAL_DRAWDOWN_PERCENT") {
+         maxTotalDrawdownPercent = limit;
+      } else if(ruleType == "FLOATING_RISK_PERCENT") {
+         floatingRiskPercent = limit;
+      }
+   }
+
+   if(maxDailyDrawdownPercent > 0.0 || maxTotalDrawdownPercent > 0.0 || floatingRiskPercent > 0.0) {
+      rulesInitialized = true;
+      Print("📋 Rules set: daily_dd=", DoubleToString(maxDailyDrawdownPercent, 2),
+            "%, total_dd=", DoubleToString(maxTotalDrawdownPercent, 2),
+            "%, floating_risk=", DoubleToString(floatingRiskPercent, 2), "%");
+   }
+}
+
+//+------------------------------------------------------------------+
+//| Get current rules status                                         |
+//+------------------------------------------------------------------+
+void GetRulesStatus(CJAVal &status) {
+   // Status is already checked every tick, just return current values
+   status["passed"] = (StringLen(failedRules) == 0);
+   status["failed_rules"];
+   status["failed_reasons"];
+   status["last_check"] = (long)lastRuleCheckTime;
+   status["total_rules"] = (rulesInitialized ? 1 : 0); // Simplified to 1 if any rules set
+
+   // Parse failed rules and reasons
+   if(StringLen(failedRules) > 0) {
+      string failedRulesArray[];
+      string failedReasonsArray[];
+
+      StringSplit(failedRules, ',', failedRulesArray);
+      StringSplit(failedReasons, ',', failedReasonsArray);
+
+      for(int i = 0; i < ArraySize(failedRulesArray); i++) {
+         StringTrimLeft(failedRulesArray[i]);
+         StringTrimRight(failedRulesArray[i]);
+         status["failed_rules"].Add(failedRulesArray[i]);
+      }
+
+      for(int i = 0; i < ArraySize(failedReasonsArray); i++) {
+         StringTrimLeft(failedReasonsArray[i]);
+         StringTrimRight(failedReasonsArray[i]);
+         status["failed_reasons"].Add(failedReasonsArray[i]);
+      }
+   }
+}
+
+//+------------------------------------------------------------------+
+//| Check current rules status and update failure tracking          |
+//+------------------------------------------------------------------+
+void CheckRulesStatus() {
+   if(!rulesInitialized) {
+      failedRules = "";
+      failedReasons = "";
+      rulesWerePassing = true;
+      lastRuleCheckTime = TimeCurrent();
+      return;
+   }
+
+   string oldFailedRules = failedRules;
+   failedRules = "";
+   failedReasons = "";
+   bool hasFailures = false;
+
+   // Check daily drawdown
+   if(maxDailyDrawdownPercent > 0.0) {
+      double dailyDD = GetCurrentDailyDrawdownPercent();
+      if(dailyDD >= maxDailyDrawdownPercent) {
+         failedRules += (StringLen(failedRules) > 0 ? "," : "") + "MAX_DAILY_DRAWDOWN_PERCENT";
+         failedReasons += (StringLen(failedReasons) > 0 ? "," : "") + GetRuleFailureReason("MAX_DAILY_DRAWDOWN_PERCENT", dailyDD, maxDailyDrawdownPercent);
+         hasFailures = true;
+      }
+   }
+
+   // Check total drawdown
+   if(maxTotalDrawdownPercent > 0.0) {
+      double totalDD = GetCurrentTotalDrawdownPercent();
+      if(totalDD >= maxTotalDrawdownPercent) {
+         failedRules += (StringLen(failedRules) > 0 ? "," : "") + "MAX_TOTAL_DRAWDOWN_PERCENT";
+         failedReasons += (StringLen(failedReasons) > 0 ? "," : "") + GetRuleFailureReason("MAX_TOTAL_DRAWDOWN_PERCENT", totalDD, maxTotalDrawdownPercent);
+         hasFailures = true;
+      }
+   }
+
+   // Check floating risk
+   if(floatingRiskPercent > 0.0) {
+      double floatingRisk = GetCurrentFloatingRiskPercent();
+      if(floatingRisk >= floatingRiskPercent) {
+         failedRules += (StringLen(failedRules) > 0 ? "," : "") + "FLOATING_RISK_PERCENT";
+         failedReasons += (StringLen(failedReasons) > 0 ? "," : "") + GetRuleFailureReason("FLOATING_RISK_PERCENT", floatingRisk, floatingRiskPercent);
+         hasFailures = true;
+      }
+   }
+
+   lastRuleCheckTime = TimeCurrent();
+
+   // Check if rules transitioned from passing to failing
+   bool rulesCurrentlyPassing = !hasFailures;
+   if(rulesWerePassing && !rulesCurrentlyPassing && oldFailedRules != failedRules) {
+      // Rules just started failing - send violation alert
+      SendRuleViolationAlert(failedRules, failedReasons);
+   }
+
+   rulesWerePassing = rulesCurrentlyPassing;
+
+   if(!hasFailures) {
+      // Only log when rules start passing again or for periodic confirmation
+      static datetime lastPassLog = 0;
+      if(TimeCurrent() - lastPassLog > 300) { // Log every 5 minutes when passing
+         Print("✅ All rules passed");
+         lastPassLog = TimeCurrent();
+      }
+   } else {
+      // Always log failures
+      Print("⚠️ Rules failed: ", failedRules);
+   }
+}
+
+//+------------------------------------------------------------------+
+//| Get rule failure reason string                                   |
+//+------------------------------------------------------------------+
+string GetRuleFailureReason(string ruleType, double currentValue, double limit) {
+   return StringFormat("%.2f%% exceeds limit of %.2f%%", currentValue, limit);
+}
+
+//+------------------------------------------------------------------+
+//| Get current daily drawdown percentage                            |
+//+------------------------------------------------------------------+
+double GetCurrentDailyDrawdownPercent() {
+   string currentLogin = (string)AccountInfoInteger(ACCOUNT_LOGIN);
+   MqlDateTime dt;
+   TimeCurrent(dt);
+   int currentDate = dt.year * 10000 + dt.mon * 100 + dt.day;
+
+   double dailyStartBalance = GetDailyStartBalance(currentLogin, currentDate);
+   double currentBalance = AccountInfoDouble(ACCOUNT_BALANCE);
+
+   if(dailyStartBalance <= 0.0) {
+      return 0.0;
+   }
+
+   double drawdown = dailyStartBalance - currentBalance;
+   return (drawdown / dailyStartBalance) * 100.0;
+}
+
+//+------------------------------------------------------------------+
+//| Get current total drawdown percentage                            |
+//+------------------------------------------------------------------+
+double GetCurrentTotalDrawdownPercent() {
+   double startBalance = marathonStartBalance;
+   if(startBalance <= 0.0) {
+      // If marathon start balance not set, use account balance at initialization
+      // For simplicity, we'll use current balance as reference (no historical drawdown)
+      return 0.0;
+   }
+
+   double currentBalance = AccountInfoDouble(ACCOUNT_BALANCE);
+   double drawdown = startBalance - currentBalance;
+
+   return (drawdown / startBalance) * 100.0;
+}
+
+//+------------------------------------------------------------------+
+//| Get current floating risk percentage                             |
+//+------------------------------------------------------------------+
+double GetCurrentFloatingRiskPercent() {
+   // Calculate risk as margin used / equity
+   double margin = AccountInfoDouble(ACCOUNT_MARGIN);
+   double equity = AccountInfoDouble(ACCOUNT_EQUITY);
+
+   if(equity <= 0.0) {
+      return 0.0;
+   }
+
+   return (margin / equity) * 100.0;
+}
+
+//+------------------------------------------------------------------+
+//| Send rule violation alert to server                              |
+//+------------------------------------------------------------------+
+void SendRuleViolationAlert(string alertFailedRules, string alertFailedReasons) {
+   if(!IsSocketConnected()) return;
+
+   CJAVal alert;
+   alert["type"] = "rule_violation";
+   alert["login"] = (string)AccountInfoInteger(ACCOUNT_LOGIN);
+   alert["timestamp"] = GetCurrentTimestamp();
+   alert["failed_rules"] = alertFailedRules;
+   alert["failed_reasons"] = alertFailedReasons;
+   alert["balance"] = AccountInfoDouble(ACCOUNT_BALANCE);
+   alert["equity"] = AccountInfoDouble(ACCOUNT_EQUITY);
+   alert["profit"] = AccountInfoDouble(ACCOUNT_PROFIT);
+   alert["margin"] = AccountInfoDouble(ACCOUNT_MARGIN);
+
+   // Add current rule values for context
+   if(maxDailyDrawdownPercent > 0.0) {
+      alert["current_daily_drawdown"] = GetCurrentDailyDrawdownPercent();
+      alert["max_daily_drawdown_limit"] = maxDailyDrawdownPercent;
+   }
+   if(maxTotalDrawdownPercent > 0.0) {
+      alert["current_total_drawdown"] = GetCurrentTotalDrawdownPercent();
+      alert["max_total_drawdown_limit"] = maxTotalDrawdownPercent;
+   }
+   if(floatingRiskPercent > 0.0) {
+      alert["current_floating_risk"] = GetCurrentFloatingRiskPercent();
+      alert["floating_risk_limit"] = floatingRiskPercent;
+   }
+
+   SendData(alert.Serialize());
+   Print("🚨 Rule violation alert sent: ", alertFailedRules);
 }
