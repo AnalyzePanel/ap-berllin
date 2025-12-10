@@ -53,6 +53,7 @@ int lastOrdersTotal = 0;
 datetime lastSnapshotSent = 0;
 datetime lastUpdateSent = 0;
 datetime lastDataSent = 0;  // Track last time any data was sent
+datetime lastEquityHistorySaved = 0;  // Track last time equity was saved to history
 string lastPositionsHash = "";
 string lastOrdersHash = "";
 
@@ -100,6 +101,9 @@ double GetCurrentDailyDrawdownPercent();
 double GetCurrentTotalDrawdownPercent();
 double GetCurrentFloatingRiskPercent();
 void SendRuleViolationAlert(string alertFailedRules, string alertFailedReasons);
+void SaveEquityHistory();
+string GetEquityHistoryVarName(string login, long timestamp);
+void LoadEquityHistoryFromStorage(string login, long fromTs, long toTs, CJAVal &arr);
 
 //+------------------------------------------------------------------+
 //| Expert initialization function                                     |
@@ -195,6 +199,12 @@ void OnTick() {
    // -2. Check rules status on every tick (if rules are initialized)
    if(rulesInitialized) {
       CheckRulesStatus();
+   }
+
+   // -2.5. Save equity history every 5 seconds
+   if(int(now - lastEquityHistorySaved) >= 5) {
+      SaveEquityHistory();
+      lastEquityHistorySaved = now;
    }
 
    // -3. Poll for incoming server queries (non-blocking)
@@ -341,6 +351,7 @@ void SendAccountSnapshot() {
    data["currency"] = AccountInfoString(ACCOUNT_CURRENCY);
    data["leverage"] = (int)AccountInfoInteger(ACCOUNT_LEVERAGE);
    data["timestamp"] = GetCurrentTimestamp();  // ✅ TIMESTAMP
+   data["isRulesSet"] = rulesInitialized;  // ✅ Indicate if rules are set
    
    // Add positions
    data["positions"];
@@ -786,28 +797,32 @@ bool TryReceiveLine(string &lineOut) {
       // but appending byte-by-byte preserves content for JSON ASCII.
       chunk += CharToString((ushort)b);
    }
-   // Hex preview of first bytes to diagnose framing/encoding
-   string hexPrev = "";
-   int maxHex = (received < 32 ? received : 32);
-   for(int k=0;k<maxHex;k++) {
-      hexPrev += StringFormat("%02X ", ubuf[k]);
-   }
-   // Debug: log raw recv preview and byte count
-   string rprev = StringSubstr(chunk, 0, 180);
-   if(StringLen(chunk) > 180) rprev += "...";
-   Print("📩 recv(", received, " bytes, nonzero=", nonzero, ") chunk=", rprev, " | hex=", hexPrev);
+   
+   // Add chunk to buffer FIRST
    recvBuffer += chunk;
    
    // Extract one line if newline present
    int nlIndex = StringFind(recvBuffer, "\n");
    if(nlIndex >= 0) {
       lineOut = StringSubstr(recvBuffer, 0, nlIndex);
-      // Remove processed part including newline
+      // Remove processed part including newline BEFORE logging
       recvBuffer = StringSubstr(recvBuffer, nlIndex + 1);
       StringTrimRight(lineOut);
       StringTrimLeft(lineOut);
+      
+      // Log AFTER extracting the actual line that will be processed
+      // This ensures the logged requestId matches what will be processed
+      string linePreview = StringSubstr(lineOut, 0, 180);
+      if(StringLen(lineOut) > 180) linePreview += "...";
+      Print("📩 recv(", received, " bytes, nonzero=", nonzero, ") extracted line: ", linePreview);
+      
       return true;
    }
+   
+   // If no complete line yet, log the received chunk for debugging
+   string rprev = StringSubstr(chunk, 0, 180);
+   if(StringLen(chunk) > 180) rprev += "...";
+   Print("📩 recv(", received, " bytes, nonzero=", nonzero, ") partial chunk (no newline yet): ", rprev);
    
    return false;
 }
@@ -819,16 +834,27 @@ void HandleIncomingMessage(const string message) {
    // Ignore empty
    if(StringLen(message) == 0) return;
    
-   // Log a short preview of any incoming line
-   string _preview = StringSubstr(message, 0, 180);
-   if(StringLen(message) > 180) _preview += "...";
-   Print("📥 Incoming line from Tokyo: ", _preview);
-   
-   // Parse JSON
+   // Parse JSON FIRST to extract requestId for accurate logging
    CJAVal parsed;
    if(!parsed.Deserialize(message)) {
       Print("⚠️ Failed to parse incoming JSON: ", message);
       return;
+   }
+   
+   // Extract requestId for logging
+   string loggedRequestId = "";
+   CJAVal *reqIdPtr = parsed["requestId"];
+   if(CheckPointer(reqIdPtr) != POINTER_INVALID && reqIdPtr != NULL) {
+      loggedRequestId = reqIdPtr.ToStr();
+   }
+   
+   // Log with requestId to match what will be processed
+   string _preview = StringSubstr(message, 0, 180);
+   if(StringLen(message) > 180) _preview += "...";
+   if(StringLen(loggedRequestId) > 0) {
+      Print("📥 Incoming line from Tokyo (requestId=", loggedRequestId, "): ", _preview);
+   } else {
+      Print("📥 Incoming line from Tokyo: ", _preview);
    }
    
    CJAVal *typePtr = parsed["type"];
@@ -837,7 +863,7 @@ void HandleIncomingMessage(const string message) {
    // Expect queries with type="query"
    if(msgType == "query") {
       // Log that a query type message is being handled
-      Print("🧭 Received query message");
+      Print("🧭 Received query message (requestId=", loggedRequestId, ")");
       HandleQuery(parsed);
       return;
    }
@@ -849,15 +875,28 @@ void HandleIncomingMessage(const string message) {
 //| Handle a query and send a response                                |
 //+------------------------------------------------------------------+
 void HandleQuery(CJAVal &query) {
-   CJAVal *reqIdPtr = query["requestId"];
-   CJAVal *actionPtr = query["action"];
+   // Log the raw query first to debug requestId issues
+   string rawQuery = query.Serialize();
+   Print("🔍 Raw query received: ", StringSubstr(rawQuery, 0, 300));
+   
+   // Extract requestId FIRST and store it as string immediately to avoid any pointer issues
    string requestId = "";
+   CJAVal *reqIdPtr = query["requestId"];
    if(CheckPointer(reqIdPtr) != POINTER_INVALID && reqIdPtr != NULL) {
       requestId = reqIdPtr.ToStr();
+      // Trim any whitespace that might have been added
+      StringTrimLeft(requestId);
+      StringTrimRight(requestId);
+      // Validate requestId is not empty
+      if(StringLen(requestId) == 0) {
+         Print("⚠️ WARNING: requestId pointer exists but ToStr() returned empty string!");
+      }
    } else {
       // Defensive: keep empty but log to ease tracing when requestId is missing
       Print("⚠️ Query received without valid requestId pointer, echoing empty requestId");
    }
+   
+   CJAVal *actionPtr = query["action"];
    string action = (actionPtr != NULL ? actionPtr.ToStr() : "");
    
    // Log action, requestId and lightweight params preview
@@ -868,14 +907,28 @@ void HandleQuery(CJAVal &query) {
       paramsPreview = StringSubstr(raw, 0, 200);
       if(StringLen(raw) > 200) paramsPreview += "...";
    }
-   Print("🔎 Query received | action=", action, " | requestId=", requestId, " | params=", paramsPreview);
+   Print("🔎 Query received | action=", action, " | requestId='", requestId, "' (length=", StringLen(requestId), ") | params=", paramsPreview);
    
+   // Create response object and set requestId as string directly (not via pointer)
    CJAVal resp;
    resp["type"] = "response";
-   resp["requestId"] = requestId;
+   resp["requestId"] = requestId;  // Set the stored string directly
    resp["login"] = (string)AccountInfoInteger(ACCOUNT_LOGIN);
    resp["timestamp"] = GetCurrentTimestamp();
    resp["ok"] = true;
+   
+   // Verify what requestId we're putting in the response
+   string responseRequestId = resp["requestId"].ToStr();
+   Print("🔍 Response requestId set to: '", responseRequestId, "' (length=", StringLen(responseRequestId), ")");
+   
+   // Double-check requestId matches before sending
+   if(requestId != responseRequestId) {
+      Print("⚠️ WARNING: RequestId mismatch! Original='", requestId, "' Response='", responseRequestId, "'");
+      // Force set it again
+      resp["requestId"] = requestId;
+      responseRequestId = resp["requestId"].ToStr();
+      Print("🔍 After fix, response requestId: '", responseRequestId, "'");
+   }
    
    bool handled = true;
    
@@ -1221,75 +1274,33 @@ void HandleQuery(CJAVal &query) {
          if(CheckPointer(vf4)!=POINTER_INVALID) fromTs = vf4.ToInt();
          if(CheckPointer(vt4)!=POINTER_INVALID) toTs = vt4.ToInt();
       }
-      datetime from = (fromTs>0 ? (datetime)fromTs : (datetime)(TimeCurrent() - 30*24*60*60));
-      datetime to = (toTs>0 ? (datetime)toTs : TimeCurrent());
+      // Use saved equity history (per 5 seconds) instead of calculating from deals
+      CJAVal arr;
+      string currentLogin = (string)AccountInfoInteger(ACCOUNT_LOGIN);
+      LoadEquityHistoryFromStorage(currentLogin, fromTs, toTs, arr);
       
-      // Equity curve should be based on balance plus all realized changes, same base as balance history.
-      // So compute baseAtFrom exactly like for balance history (balance at 'from').
-      datetime nowdt2 = TimeCurrent();
-      double baseAtFrom = AccountInfoDouble(ACCOUNT_BALANCE);
-      if(HistorySelect(from, nowdt2)) {
-         int tot2 = HistoryDealsTotal();
-         for(int i=0;i<tot2;i++) {
-            ulong deal2 = HistoryDealGetTicket(i);
-            if(deal2<=0) continue;
-            long ts2 = (long)HistoryDealGetInteger(deal2, DEAL_TIME);
-            if(ts2 <= from) continue;
-            int dtype2 = (int)HistoryDealGetInteger(deal2, DEAL_TYPE);
-            int entry2 = (int)HistoryDealGetInteger(deal2, DEAL_ENTRY);
-            double pr2 = HistoryDealGetDouble(deal2, DEAL_PROFIT);
-            bool includeBal = (dtype2 == DEAL_TYPE_BALANCE || dtype2 == DEAL_TYPE_CREDIT || dtype2 == DEAL_TYPE_CHARGE
-                               || dtype2 == DEAL_TYPE_BONUS || dtype2 == DEAL_TYPE_COMMISSION || dtype2 == DEAL_TYPE_COMMISSION_DAILY
-                               || dtype2 == DEAL_TYPE_COMMISSION_MONTHLY || dtype2 == DEAL_TYPE_INTEREST
-                               || ((dtype2 == DEAL_TYPE_BUY || dtype2 == DEAL_TYPE_SELL) && entry2 == DEAL_ENTRY_OUT));
-            if(!includeBal) continue;
-            baseAtFrom -= pr2;
-         }
-      }
-
-      if(!HistorySelect(from, to)) {
-         resp["ok"] = false;
-         resp["error"] = "HistorySelect failed";
+      // Always set data field, even if empty
+      // If no historical data, at least return current equity point
+      if(arr.Size() == 0) {
+         // Return current equity as a single point if no history available
+         datetime now = TimeCurrent();
+         CJAVal currentPoint;
+         currentPoint["time"] = (long)now;
+         currentPoint["equity"] = AccountInfoDouble(ACCOUNT_EQUITY);
+         arr.Add(currentPoint);
+         Print("⚠️ No equity history data found in storage, returning current equity point");
       } else {
-         // Build equity curve using same deltas as balance (deposits, withdrawals, commissions, realized trades).
-         struct EqEv { long t; double delta; };
-         EqEv eqevs[];
-         int total = HistoryDealsTotal();
-         for(int i=0;i<total;i++) {
-            ulong dticket = HistoryDealGetTicket(i);
-            if(dticket<=0) continue;
-            int dtype = (int)HistoryDealGetInteger(dticket, DEAL_TYPE);
-            int entry = (int)HistoryDealGetInteger(dticket, DEAL_ENTRY);
-            bool includeEq = (dtype == DEAL_TYPE_BALANCE || dtype == DEAL_TYPE_CREDIT || dtype == DEAL_TYPE_CHARGE
-                              || dtype == DEAL_TYPE_BONUS || dtype == DEAL_TYPE_COMMISSION || dtype == DEAL_TYPE_COMMISSION_DAILY
-                              || dtype == DEAL_TYPE_COMMISSION_MONTHLY || dtype == DEAL_TYPE_INTEREST
-                              || ((dtype == DEAL_TYPE_BUY || dtype == DEAL_TYPE_SELL) && entry == DEAL_ENTRY_OUT));
-            if(!includeEq) continue;
-            long tme = (long)HistoryDealGetInteger(dticket, DEAL_TIME);
-            double dlt = HistoryDealGetDouble(dticket, DEAL_PROFIT);
-            int sz = ArraySize(eqevs);
-            ArrayResize(eqevs, sz+1);
-            eqevs[sz].t = tme;
-            eqevs[sz].delta = dlt;
-         }
-         // Sort by time asc
-         int n = ArraySize(eqevs);
-         for(int i=1;i<n;i++) {
-            EqEv key = eqevs[i];
-            int j = i-1;
-            while(j>=0 && eqevs[j].t > key.t) { eqevs[j+1]=eqevs[j]; j--; }
-            eqevs[j+1] = key;
-         }
-         CJAVal arr;
-         double eq = baseAtFrom;
-         for(int i=0;i<n;i++) {
-            eq += eqevs[i].delta;
-            CJAVal e;
-            e["time"] = (long)eqevs[i].t;
-            e["equity"] = eq; // equity based on balance + all realized changes
-            arr.Add(e);
-         }
-         resp["data"] = arr;
+         Print("✅ Equity history retrieved: ", arr.Size(), " points");
+      }
+      
+      resp["data"] = arr;
+      
+      // Debug: verify data is set
+      CJAVal *dataPtr = resp["data"];
+      if(CheckPointer(dataPtr) != POINTER_INVALID && dataPtr != NULL) {
+         Print("✅ Response data field set successfully, size=", dataPtr.Size());
+      } else {
+         Print("❌ ERROR: Response data field is NULL or invalid!");
       }
    } else
    if(action == "get_performance_report") {
@@ -2749,4 +2760,114 @@ void SendRuleViolationAlert(string alertFailedRules, string alertFailedReasons) 
 
    SendData(alert.Serialize());
    Print("🚨 Rule violation alert sent: ", alertFailedRules);
+}
+
+//+------------------------------------------------------------------+
+//| Save equity history every 5 seconds                              |
+//+------------------------------------------------------------------+
+void SaveEquityHistory() {
+   string currentLogin = (string)AccountInfoInteger(ACCOUNT_LOGIN);
+   datetime now = TimeCurrent();
+   long timestamp = (long)now;
+   double equity = AccountInfoDouble(ACCOUNT_EQUITY);
+   
+   // Round timestamp to nearest 5 seconds for consistent storage
+   long roundedTimestamp = (timestamp / 5) * 5;
+   
+   string varName = GetEquityHistoryVarName(currentLogin, roundedTimestamp);
+   
+   // Store equity value directly (timestamp is in the variable name)
+   GlobalVariableSet(varName, equity);
+   
+   // Set expiration to 7 days (604800 seconds) to auto-cleanup old data
+   GlobalVariableSet(varName + "_exp", (double)(now + 7*24*60*60));
+   
+   GlobalVariablesFlush();
+}
+
+//+------------------------------------------------------------------+
+//| Get global variable name for equity history                      |
+//+------------------------------------------------------------------+
+string GetEquityHistoryVarName(string login, long timestamp) {
+   // Round to 5-second intervals
+   long roundedTs = (timestamp / 5) * 5;
+   return "EquityHistory_" + login + "_" + IntegerToString(roundedTs);
+}
+
+//+------------------------------------------------------------------+
+//| Load equity history from storage (global variables)              |
+//+------------------------------------------------------------------+
+void LoadEquityHistoryFromStorage(string login, long fromTs, long toTs, CJAVal &arr) {
+   // Ensure arr is initialized as an array
+   arr = CJAVal();
+   arr.m_type = jtARRAY;
+   
+   datetime now = TimeCurrent();
+   long currentTs = (long)now;
+   
+   // Default range: last 30 days if not specified
+   if(fromTs <= 0) fromTs = currentTs - 30*24*60*60;
+   if(toTs <= 0) toTs = currentTs;
+   
+   // Round timestamps to 5-second intervals
+   long fromRounded = (fromTs / 5) * 5;
+   long toRounded = (toTs / 5) * 5;
+   
+   Print("📊 Loading equity history: login=", login, " from=", fromRounded, " to=", toRounded);
+   
+   // Collect all equity history points in range
+   struct EquityPoint {
+      long timestamp;
+      double equity;
+   };
+   EquityPoint points[];
+   int pointsCount = 0;
+   
+   // Iterate through 5-second intervals in the range
+   for(long ts = fromRounded; ts <= toRounded; ts += 5) {
+      string varName = GetEquityHistoryVarName(login, ts);
+      
+      // Check if variable exists and not expired
+      if(GlobalVariableCheck(varName)) {
+         // Check expiration
+         string expVarName = varName + "_exp";
+         if(GlobalVariableCheck(expVarName)) {
+            double expTime = GlobalVariableGet(expVarName);
+            if((long)expTime < (long)now) {
+               // Expired, skip
+               continue;
+            }
+         }
+         
+         // Get stored equity value (timestamp is already in ts from loop)
+         double storedEquity = GlobalVariableGet(varName);
+         
+         // Add to points array
+         ArrayResize(points, pointsCount + 1);
+         points[pointsCount].timestamp = ts;
+         points[pointsCount].equity = storedEquity;
+         pointsCount++;
+      }
+   }
+   
+   // Sort points by timestamp
+   for(int i = 1; i < pointsCount; i++) {
+      EquityPoint key = points[i];
+      int j = i - 1;
+      while(j >= 0 && points[j].timestamp > key.timestamp) {
+         points[j + 1] = points[j];
+         j--;
+      }
+      points[j + 1] = key;
+   }
+   
+   // Build response array
+   for(int i = 0; i < pointsCount; i++) {
+      CJAVal e;
+      e["time"] = (long)points[i].timestamp;
+      e["equity"] = points[i].equity;
+      arr.Add(e);
+   }
+   
+   Print("📊 Loaded ", arr.Size(), " equity history points from storage");
 }
