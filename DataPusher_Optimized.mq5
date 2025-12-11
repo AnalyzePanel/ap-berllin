@@ -33,7 +33,7 @@ int setsockopt(SOCKET64 s, int level, int optname, int &optval, int optlen);
 #define STATUS_RECONNECTING  -2
 
 // Message intervals (in seconds)
-#define SNAPSHOT_INTERVAL 30  // Full account snapshot every 30 seconds
+#define SNAPSHOT_INTERVAL 5  // Full account snapshot every 30 seconds
 #define UPDATE_INTERVAL 5     // Quick updates every 5 seconds
 #define HEARTBEAT_INTERVAL 8  // Send heartbeat every 8 seconds to keep connection alive (more aggressive)
 
@@ -71,6 +71,13 @@ string failedReasons = "";               // Comma-separated list of failure reas
 bool rulesInitialized = false;           // Whether rules have been set
 bool rulesWerePassing = true;            // Track if rules were passing on last check (for violation alerts)
 
+// Subscription variables
+string subscribedDataTypes[];            // Array of subscribed data types
+int subscriptionIntervals[];             // Array of subscription intervals (seconds) corresponding to subscribedDataTypes
+datetime lastSubscriptionSent[];         // Last time each subscription type was sent
+int subscriptionCount = 0;               // Number of active subscriptions
+bool subscriptionsInitialized = false;   // Whether subscriptions have been initialized
+
 // Forward declarations
 void SendAccountSnapshot();
 void SendQuickUpdate();
@@ -104,6 +111,22 @@ void SendRuleViolationAlert(string alertFailedRules, string alertFailedReasons);
 void SaveEquityHistory();
 string GetEquityHistoryVarName(string login, long timestamp);
 void LoadEquityHistoryFromStorage(string login, long fromTs, long toTs, CJAVal &arr);
+void SendSubscriptionData();
+void SendSubscriptionDataForType(string dataType, int interval);
+void HandleSubscriptionCommand(CJAVal &command);
+void SubscribeToDataTypes(string &dataTypes[], int &intervals[], int count);
+void UnsubscribeFromDataTypes(string &dataTypes[], int count);
+bool IsSubscribed(string dataType);
+int GetSubscriptionInterval(string dataType);
+datetime GetLastSubscriptionSent(string dataType);
+void UpdateLastSubscriptionSent(string dataType);
+void GetEquityHistoryData(CJAVal &data);
+void GetBalanceHistoryData(CJAVal &data);
+void GetPerformanceReportData(CJAVal &data);
+void GetTradeHistoryData(CJAVal &data);
+void GetSymbolStatisticsData(CJAVal &data);
+void GetRulesStatusData(CJAVal &data);
+void GetDailyStartBalanceData(CJAVal &data);
 
 //+------------------------------------------------------------------+
 //| Expert initialization function                                     |
@@ -133,6 +156,9 @@ int OnInit() {
    
    // Initialize daily start balance (using terminal global variables)
    UpdateDailyStartBalance();
+   
+   // Subscriptions will be set by server via query on first connection
+   // No need to auto-subscribe here - server will send subscribe query
    
    // Send initial full snapshot
    if(IsSocketConnected()) {
@@ -205,6 +231,11 @@ void OnTick() {
    if(int(now - lastEquityHistorySaved) >= 5) {
       SaveEquityHistory();
       lastEquityHistorySaved = now;
+   }
+
+   // -2.6. Send subscription data if subscribed (every 1 second by default)
+   if(subscriptionsInitialized) {
+      SendSubscriptionData();
    }
 
    // -3. Poll for incoming server queries (non-blocking)
@@ -859,6 +890,9 @@ void HandleIncomingMessage(const string message) {
    
    CJAVal *typePtr = parsed["type"];
    string msgType = (typePtr != NULL ? typePtr.ToStr() : "");
+   
+   // Subscription commands are now handled via queries (action="subscribe"/"unsubscribe")
+   // No need to handle push messages for subscriptions
    
    // Expect queries with type="query"
    if(msgType == "query") {
@@ -2489,6 +2523,92 @@ void HandleQuery(CJAVal &query) {
       resp["data"] = status;
       Print("✅ Rules status retrieved");
    } else
+   if(action == "subscribe") {
+      // Subscribe to data types via query
+      CJAVal *paramsPtr = query["params"];
+      if(CheckPointer(paramsPtr) != POINTER_INVALID) {
+         CJAVal *subsPtr = (*paramsPtr)["subscriptions"];
+         CJAVal *intervalPtr = (*paramsPtr)["interval"];
+         
+         if(CheckPointer(subsPtr) != POINTER_INVALID && subsPtr.m_type == jtARRAY) {
+            int subsCount = subsPtr.Size();
+            if(subsCount > 0) {
+               string dataTypes[];
+               ArrayResize(dataTypes, subsCount);
+               for(int i = 0; i < subsCount; i++) {
+                  dataTypes[i] = subsPtr[i].ToStr();
+               }
+               
+               int interval = 1;  // Default 1 second
+               if(CheckPointer(intervalPtr) != POINTER_INVALID) {
+                  interval = (int)intervalPtr.ToInt();
+                  if(interval < 1) interval = 1;
+               }
+               
+               int intervals[];
+               ArrayResize(intervals, subsCount);
+               for(int i = 0; i < subsCount; i++) {
+                  intervals[i] = interval;
+               }
+               
+               SubscribeToDataTypes(dataTypes, intervals, subsCount);
+               
+               // Mark subscriptions as initialized since we've subscribed to at least one type
+               subscriptionsInitialized = true;
+               
+               CJAVal data;
+               data["message"] = "Subscribed successfully";
+               data["subscriptions"] = subsCount;
+               resp["data"] = data;
+               Print("✅ Subscribed to ", subsCount, " data type(s)");
+            } else {
+               resp["ok"] = false;
+               resp["error"] = "Empty subscriptions array";
+            }
+         } else {
+            resp["ok"] = false;
+            resp["error"] = "Invalid or missing subscriptions parameter";
+         }
+      } else {
+         resp["ok"] = false;
+         resp["error"] = "Missing params";
+      }
+   } else
+   if(action == "unsubscribe") {
+      // Unsubscribe from data types via query
+      CJAVal *paramsPtr = query["params"];
+      if(CheckPointer(paramsPtr) != POINTER_INVALID) {
+         CJAVal *subsPtr = (*paramsPtr)["subscriptions"];
+         
+         if(CheckPointer(subsPtr) != POINTER_INVALID && subsPtr.m_type == jtARRAY) {
+            int subsCount = subsPtr.Size();
+            if(subsCount > 0) {
+               string dataTypes[];
+               ArrayResize(dataTypes, subsCount);
+               for(int i = 0; i < subsCount; i++) {
+                  dataTypes[i] = subsPtr[i].ToStr();
+               }
+               
+               UnsubscribeFromDataTypes(dataTypes, subsCount);
+               
+               CJAVal data;
+               data["message"] = "Unsubscribed successfully";
+               data["subscriptions"] = subsCount;
+               resp["data"] = data;
+               Print("✅ Unsubscribed from ", subsCount, " data type(s)");
+            } else {
+               resp["ok"] = false;
+               resp["error"] = "Empty subscriptions array";
+            }
+         } else {
+            resp["ok"] = false;
+            resp["error"] = "Invalid or missing subscriptions parameter";
+         }
+      } else {
+         resp["ok"] = false;
+         resp["error"] = "Missing params";
+      }
+   } else
    if(action == "set_marathon_start_balance") {
       // Set marathon start balance for total drawdown calculation
       CJAVal *paramsPtr = query["params"];
@@ -2870,4 +2990,456 @@ void LoadEquityHistoryFromStorage(string login, long fromTs, long toTs, CJAVal &
    }
    
    Print("📊 Loaded ", arr.Size(), " equity history points from storage");
+}
+
+//+------------------------------------------------------------------+
+//| Subscribe to data types                                          |
+//+------------------------------------------------------------------+
+void SubscribeToDataTypes(string &dataTypes[], int &intervals[], int count) {
+   for(int i = 0; i < count; i++) {
+      string dataType = dataTypes[i];
+      int interval = intervals[i];
+      
+      // Check if already subscribed
+      bool alreadySubscribed = false;
+      for(int j = 0; j < subscriptionCount; j++) {
+         if(subscribedDataTypes[j] == dataType) {
+            // Update interval
+            subscriptionIntervals[j] = interval;
+            alreadySubscribed = true;
+            break;
+         }
+      }
+      
+      if(!alreadySubscribed) {
+         // Add new subscription
+         ArrayResize(subscribedDataTypes, subscriptionCount + 1);
+         ArrayResize(subscriptionIntervals, subscriptionCount + 1);
+         ArrayResize(lastSubscriptionSent, subscriptionCount + 1);
+         
+         subscribedDataTypes[subscriptionCount] = dataType;
+         subscriptionIntervals[subscriptionCount] = interval;
+         lastSubscriptionSent[subscriptionCount] = 0;  // Never sent before
+         
+         subscriptionCount++;
+      }
+   }
+   
+   Print("📡 Subscribed to ", count, " data type(s)");
+}
+
+//+------------------------------------------------------------------+
+//| Unsubscribe from data types                                       |
+//+------------------------------------------------------------------+
+void UnsubscribeFromDataTypes(string &dataTypes[], int count) {
+   for(int i = 0; i < count; i++) {
+      string dataType = dataTypes[i];
+      
+      // Find and remove subscription
+      for(int j = 0; j < subscriptionCount; j++) {
+         if(subscribedDataTypes[j] == dataType) {
+            // Remove by shifting array
+            for(int k = j; k < subscriptionCount - 1; k++) {
+               subscribedDataTypes[k] = subscribedDataTypes[k + 1];
+               subscriptionIntervals[k] = subscriptionIntervals[k + 1];
+               lastSubscriptionSent[k] = lastSubscriptionSent[k + 1];
+            }
+            
+            ArrayResize(subscribedDataTypes, subscriptionCount - 1);
+            ArrayResize(subscriptionIntervals, subscriptionCount - 1);
+            ArrayResize(lastSubscriptionSent, subscriptionCount - 1);
+            
+            subscriptionCount--;
+            break;
+         }
+      }
+   }
+   
+   Print("📡 Unsubscribed from ", count, " data type(s)");
+}
+
+//+------------------------------------------------------------------+
+//| Check if subscribed to a data type                                |
+//+------------------------------------------------------------------+
+bool IsSubscribed(string dataType) {
+   for(int i = 0; i < subscriptionCount; i++) {
+      if(subscribedDataTypes[i] == dataType) {
+         return true;
+      }
+   }
+   return false;
+}
+
+//+------------------------------------------------------------------+
+//| Get subscription interval for a data type                         |
+//+------------------------------------------------------------------+
+int GetSubscriptionInterval(string dataType) {
+   for(int i = 0; i < subscriptionCount; i++) {
+      if(subscribedDataTypes[i] == dataType) {
+         return subscriptionIntervals[i];
+      }
+   }
+   return 0;
+}
+
+//+------------------------------------------------------------------+
+//| Get last time subscription data was sent                          |
+//+------------------------------------------------------------------+
+datetime GetLastSubscriptionSent(string dataType) {
+   for(int i = 0; i < subscriptionCount; i++) {
+      if(subscribedDataTypes[i] == dataType) {
+         return lastSubscriptionSent[i];
+      }
+   }
+   return 0;
+}
+
+//+------------------------------------------------------------------+
+//| Update last time subscription data was sent                       |
+//+------------------------------------------------------------------+
+void UpdateLastSubscriptionSent(string dataType) {
+   datetime now = TimeCurrent();
+   for(int i = 0; i < subscriptionCount; i++) {
+      if(subscribedDataTypes[i] == dataType) {
+         lastSubscriptionSent[i] = now;
+         break;
+      }
+   }
+}
+
+//+------------------------------------------------------------------+
+//| Handle subscription command from server                           |
+//+------------------------------------------------------------------+
+void HandleSubscriptionCommand(CJAVal &command) {
+   CJAVal *typePtr = command["type"];
+   string cmdType = (typePtr != NULL ? typePtr.ToStr() : "");
+   
+   CJAVal *subsPtr = command["subscriptions"];
+   if(CheckPointer(subsPtr) == POINTER_INVALID || subsPtr.m_type != jtARRAY) {
+      Print("⚠️ Subscription command missing or invalid subscriptions array");
+      return;
+   }
+   
+   int subsCount = subsPtr.Size();
+   if(subsCount == 0) {
+      Print("⚠️ Subscription command has empty subscriptions array");
+      return;
+   }
+   
+   string dataTypes[];
+   ArrayResize(dataTypes, subsCount);
+   for(int i = 0; i < subsCount; i++) {
+      dataTypes[i] = subsPtr[i].ToStr();
+   }
+   
+   if(cmdType == "subscribe") {
+      // Get interval (default 1 second)
+      int interval = 1;
+      CJAVal *intervalPtr = command["interval"];
+      if(CheckPointer(intervalPtr) != POINTER_INVALID) {
+         interval = (int)intervalPtr.ToInt();
+         if(interval < 1) interval = 1;  // Minimum 1 second
+      }
+      
+      int intervals[];
+      ArrayResize(intervals, subsCount);
+      for(int i = 0; i < subsCount; i++) {
+         intervals[i] = interval;
+      }
+      
+      SubscribeToDataTypes(dataTypes, intervals, subsCount);
+   } else if(cmdType == "unsubscribe") {
+      UnsubscribeFromDataTypes(dataTypes, subsCount);
+   }
+}
+
+//+------------------------------------------------------------------+
+//| Send subscription data for all active subscriptions              |
+//+------------------------------------------------------------------+
+void SendSubscriptionData() {
+   datetime now = TimeCurrent();
+   
+   // Round-robin through subscriptions to avoid message bursts
+   static int lastProcessedIndex = 0;
+   int processedThisTick = 0;
+   int maxPerTick = 1;  // Send max 1 subscription per tick to avoid overload
+   
+   for(int i = 0; i < subscriptionCount && processedThisTick < maxPerTick; i++) {
+      int idx = (lastProcessedIndex + i) % subscriptionCount;
+      string dataType = subscribedDataTypes[idx];
+      int interval = subscriptionIntervals[idx];
+      datetime lastSent = lastSubscriptionSent[idx];
+      
+      // Check if it's time to send this subscription
+      if(int(now - lastSent) >= interval) {
+         SendSubscriptionDataForType(dataType, interval);
+         UpdateLastSubscriptionSent(dataType);
+         processedThisTick++;
+      }
+   }
+   
+   // Update index for next round-robin
+   if(processedThisTick > 0) {
+      lastProcessedIndex = (lastProcessedIndex + processedThisTick) % subscriptionCount;
+   }
+}
+
+//+------------------------------------------------------------------+
+//| Send subscription data for a specific type                        |
+//+------------------------------------------------------------------+
+void SendSubscriptionDataForType(string dataType, int interval) {
+   if(!IsSocketConnected()) return;
+   
+   string currentLogin = (string)AccountInfoInteger(ACCOUNT_LOGIN);
+   CJAVal subData;
+   
+   subData["type"] = "subscription_data";
+   subData["login"] = currentLogin;
+   subData["data_type"] = dataType;
+   subData["timestamp"] = GetCurrentTimestamp();
+   
+   CJAVal data;
+   bool hasData = false;
+   
+   if(dataType == "equity_history") {
+      GetEquityHistoryData(data);
+      hasData = true;
+   } else if(dataType == "balance_history") {
+      GetBalanceHistoryData(data);
+      hasData = true;
+   } else if(dataType == "performance_report") {
+      GetPerformanceReportData(data);
+      hasData = true;
+   } else if(dataType == "trade_history") {
+      GetTradeHistoryData(data);
+      hasData = true;
+   } else if(dataType == "symbol_statistics") {
+      GetSymbolStatisticsData(data);
+      hasData = true;
+   } else if(dataType == "rules_status") {
+      GetRulesStatusData(data);
+      hasData = true;
+   } else if(dataType == "daily_start_balance") {
+      GetDailyStartBalanceData(data);
+      hasData = true;
+   }
+   
+   if(hasData) {
+      subData["data"] = data;
+      SendData(subData.Serialize());
+      Print("📡 Sent subscription data: type=", dataType);
+   }
+}
+
+//+------------------------------------------------------------------+
+//| Get equity history data for subscription                          |
+//| Returns last 1 minute of data (since subscription interval is 60s)|
+//+------------------------------------------------------------------+
+void GetEquityHistoryData(CJAVal &arr) {
+   string currentLogin = (string)AccountInfoInteger(ACCOUNT_LOGIN);
+   datetime now = TimeCurrent();
+   long currentTs = (long)now;
+   
+   // Get last 1 minute of equity history (since subscription sends every 60s)
+   // This ensures we have enough data for 1-minute bucket dًownsampling
+   long fromTs = currentTs - 60;  // Last 60 seconds
+   long toTs = currentTs;
+   
+   LoadEquityHistoryFromStorage(currentLogin, fromTs, toTs, arr);
+   
+   // Always include current equity point
+   CJAVal e;
+   e["time"] = (long)TimeCurrent();
+   e["equity"] = AccountInfoDouble(ACCOUNT_EQUITY);
+   arr.Add(e);
+}
+
+//+------------------------------------------------------------------+
+//| Get balance history data for subscription                         |
+//+------------------------------------------------------------------+
+void GetBalanceHistoryData(CJAVal &arr) {
+   datetime nowdt = TimeCurrent();
+   datetime from = nowdt - 24*60*60;  // Last 24 hours
+   datetime to = nowdt;
+   
+   // Get balance history from deals (last 24 hours)
+   if(HistorySelect(from, to)) {
+      int total = HistoryDealsTotal();
+      
+      // Collect balance-affecting events
+      struct BEvent { long t; double delta; long ticket; int dtype; string comment; };
+      BEvent evs[];
+      int evsCount = 0;
+      
+      for(int i = 0; i < total; i++) {
+         ulong dealTicket = HistoryDealGetTicket(i);
+         if(dealTicket <= 0) continue;
+         
+         int dtype = (int)HistoryDealGetInteger(dealTicket, DEAL_TYPE);
+         int entry = (int)HistoryDealGetInteger(dealTicket, DEAL_ENTRY);
+         
+         bool include = (dtype == DEAL_TYPE_BALANCE || dtype == DEAL_TYPE_CREDIT || dtype == DEAL_TYPE_CHARGE
+                        || dtype == DEAL_TYPE_BONUS || dtype == DEAL_TYPE_COMMISSION || dtype == DEAL_TYPE_COMMISSION_DAILY
+                        || dtype == DEAL_TYPE_COMMISSION_MONTHLY || dtype == DEAL_TYPE_INTEREST
+                        || ((dtype == DEAL_TYPE_BUY || dtype == DEAL_TYPE_SELL) && entry == DEAL_ENTRY_OUT));
+         if(!include) continue;
+         
+         long tme = (long)HistoryDealGetInteger(dealTicket, DEAL_TIME);
+         double dlt = HistoryDealGetDouble(dealTicket, DEAL_PROFIT);
+         
+         ArrayResize(evs, evsCount + 1);
+         evs[evsCount].t = tme;
+         evs[evsCount].delta = dlt;
+         evs[evsCount].ticket = (long)dealTicket;
+         evs[evsCount].dtype = dtype;
+         evs[evsCount].comment = HistoryDealGetString(dealTicket, DEAL_COMMENT);
+         evsCount++;
+      }
+      
+      // Calculate running balance from current balance backwards
+      double currentBalance = AccountInfoDouble(ACCOUNT_BALANCE);
+      double running = currentBalance;
+      
+      // Sort by time (descending) to work backwards
+      for(int i = 1; i < evsCount; i++) {
+         BEvent key = evs[i];
+         int j = i - 1;
+         while(j >= 0 && evs[j].t < key.t) {  // Reverse sort (newest first)
+            evs[j + 1] = evs[j];
+            j--;
+         }
+         evs[j + 1] = key;
+      }
+      
+      // Build response array (oldest to newest)
+      double balances[];
+      long timestamps[];
+      ArrayResize(balances, evsCount + 1);
+      ArrayResize(timestamps, evsCount + 1);
+      
+      // Start with current balance
+      balances[0] = currentBalance;
+      timestamps[0] = (long)nowdt;
+      
+      // Work backwards
+      for(int i = 0; i < evsCount; i++) {
+         running -= evs[i].delta;
+         balances[i + 1] = running;
+         timestamps[i + 1] = evs[i].t;
+      }
+      
+      // Build array in chronological order (oldest first)
+      arr = CJAVal();
+      arr.m_type = jtARRAY;
+      for(int i = evsCount; i >= 0; i--) {
+         CJAVal e;
+         e["time"] = timestamps[i];
+         e["balance"] = balances[i];
+         arr.Add(e);
+      }
+   } else {
+      // No history, return current balance
+      arr = CJAVal();
+      arr.m_type = jtARRAY;
+      CJAVal e;
+      e["time"] = (long)TimeCurrent();
+      e["balance"] = AccountInfoDouble(ACCOUNT_BALANCE);
+      arr.Add(e);
+   }
+}
+
+//+------------------------------------------------------------------+
+//| Get performance report data for subscription                      |
+//+------------------------------------------------------------------+
+void GetPerformanceReportData(CJAVal &rep) {
+   // Return current performance snapshot (simplified)
+   rep["balance"] = AccountInfoDouble(ACCOUNT_BALANCE);
+   rep["equity"] = AccountInfoDouble(ACCOUNT_EQUITY);
+   rep["profit"] = AccountInfoDouble(ACCOUNT_PROFIT);
+   rep["margin"] = AccountInfoDouble(ACCOUNT_MARGIN);
+   rep["free_margin"] = AccountInfoDouble(ACCOUNT_MARGIN_FREE);
+   rep["margin_level"] = AccountInfoDouble(ACCOUNT_MARGIN_LEVEL);
+   
+   // For full performance report, would need to query history
+   // This is a lightweight snapshot for subscription
+}
+
+//+------------------------------------------------------------------+
+//| Get trade history data for subscription                           |
+//+------------------------------------------------------------------+
+void GetTradeHistoryData(CJAVal &arr) {
+   // Return recent trades (last 100)
+   datetime now = TimeCurrent();
+   datetime from = now - 7*24*60*60;  // Last 7 days
+   datetime to = now;
+   
+   arr = CJAVal();
+   arr.m_type = jtARRAY;
+   
+   if(HistorySelect(from, to)) {
+      // Simplified: return last 100 closed trades
+      // Full implementation would be similar to HandleQuery's get_trade_history
+      int total = HistoryDealsTotal();
+      int added = 0;
+      int maxTrades = 100;
+      
+      for(int i = total - 1; i >= 0 && added < maxTrades; i--) {
+         ulong dticket = HistoryDealGetTicket(i);
+         if(dticket <= 0) continue;
+         
+         int dtype = (int)HistoryDealGetInteger(dticket, DEAL_TYPE);
+         int entry = (int)HistoryDealGetInteger(dticket, DEAL_ENTRY);
+         
+         // Only closed trades
+         if((dtype == DEAL_TYPE_BUY || dtype == DEAL_TYPE_SELL) && entry == DEAL_ENTRY_OUT) {
+            CJAVal t;
+            t["open_time"] = (long)HistoryDealGetInteger(dticket, DEAL_TIME);
+            t["close_time"] = (long)HistoryDealGetInteger(dticket, DEAL_TIME);
+            t["profit"] = HistoryDealGetDouble(dticket, DEAL_PROFIT);
+            t["symbol"] = HistoryDealGetString(dticket, DEAL_SYMBOL);
+            t["volume"] = HistoryDealGetDouble(dticket, DEAL_VOLUME);
+            arr.Add(t);
+            added++;
+         }
+      }
+   }
+   
+   // If no trades, return empty array
+}
+
+//+------------------------------------------------------------------+
+//| Get symbol statistics data for subscription                       |
+//+------------------------------------------------------------------+
+void GetSymbolStatisticsData(CJAVal &symbols) {
+   // Return simplified symbol statistics
+   // Full implementation would aggregate trades by symbol
+   symbols = CJAVal();
+   symbols.m_type = jtARRAY;
+   
+   // For now, return empty (full stats would require trade aggregation)
+   // This can be populated with actual statistics if needed
+}
+
+//+------------------------------------------------------------------+
+//| Get rules status data for subscription                            |
+//+------------------------------------------------------------------+
+void GetRulesStatusData(CJAVal &status) {
+   // Get current rules status (reuse existing function)
+   GetRulesStatus(status);
+}
+
+//+------------------------------------------------------------------+
+//| Get daily start balance data for subscription                     |
+//+------------------------------------------------------------------+
+void GetDailyStartBalanceData(CJAVal &data) {
+   string currentLogin = (string)AccountInfoInteger(ACCOUNT_LOGIN);
+   UpdateDailyStartBalance();
+   
+   MqlDateTime dt;
+   TimeCurrent(dt);
+   int currentDate = dt.year * 10000 + dt.mon * 100 + dt.day;
+   
+   data["login"] = currentLogin;
+   data["date"] = currentDate;
+   data["balance"] = GetDailyStartBalance(currentLogin, currentDate);
 }
